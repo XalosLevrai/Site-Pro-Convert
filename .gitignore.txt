@@ -1,0 +1,18 @@
+# Fichiers de l'environnement Python
+.venv/
+venv/
+
+# Base de données SQLite
+# Si vous voulez garder les comptes utilisateurs, ne pas décommenter users.db
+# Si vous voulez une base de données vide à chaque déploiement, décommenter la ligne.
+# Heroku efface les données de fichiers, donc la base SQLite n'est pas recommandée à long terme.
+
+# users.db 
+
+# Dossiers de travail locaux
+uploads/
+converted/
+
+# Cache Python
+__pycache__/
+*.pyc

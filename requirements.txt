@@ -1,0 +1,11 @@
+lask
+Flask-SQLAlchemy
+Flask-Login
+Werkzeug
+Pillow
+yt-dlp
+gunicorn
+
+# Remplacement de ffmpeg-python par python-ffmpeg pour Render
+python-ffmpeg
+pynacl
