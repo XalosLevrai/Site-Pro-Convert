@@ -7,7 +7,7 @@ import datetime
 import random
 import string
 import yt_dlp
-import ffmpeg
+# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # --------------------------
@@ -32,7 +32,7 @@ if database_url and database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False # Bonne pratique en production
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False 
 
 # Dossiers d'uploads
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -64,8 +64,6 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    # Note : Le nom de colonne 'password' peut être un problème pour certains moteurs SQL. 
-    # Le type string(128) est requis pour les hashs.
     password = db.Column(db.String(128), nullable=False) 
 
     # Relation d'Amis
@@ -87,10 +85,9 @@ class User(db.Model):
     def add_friend(self, user):
         if not self.is_friend(user):
             self.friends.append(user)
-            user.friends.append(self) # Relation bidirectionnelle
+            user.friends.append(self) 
 
     def is_friend(self, user):
-        # Utilise la session pour interroger la base de données
         with app.app_context():
             return db.session.query(friends).filter(
                 friends.c.user_id == self.id, 
@@ -101,12 +98,11 @@ class User(db.Model):
         return f"User('{self.username}')"
 
 # Création des tables de base de données si elles n'existent pas
-# Cette étape est SÛRE car elle est faite sur PostgreSQL
 with app.app_context():
     db.create_all()
 
 # --------------------------
-# 3. LE CODE HTML/CSS/JS INTÉGRÉ
+# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Non modifié)
 # --------------------------
 
 HTML_TEMPLATE = """
@@ -168,7 +164,7 @@ HTML_TEMPLATE = """
                         <button type="submit">Ajouter l'Ami</button>
                     </form>
 
-                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Publier (YouTube/TikTok)</h3>
+                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Publier (Vidéo)</h3>
                     <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data">
                         <input type="text" name="title" placeholder="Titre de la vidéo" required>
                         <input type="file" name="file" required>
@@ -233,7 +229,7 @@ HTML_TEMPLATE = """
                     <button onclick="sendMessage()">Envoyer</button>
                 </div>
                 
-                <h2 style="margin-top: 40px;">📼 Fil d'Actualité Vidéo</h2>
+                <h2 style="margin-top: 40px;">📼 Fil d'Actualité Vidéo (Fonctionnalité désactivée)</h2>
                 <div class="video-grid">
                     {% for video in uploaded_videos %}
                         <div class="video-item">
@@ -243,13 +239,13 @@ HTML_TEMPLATE = """
                                 <p style="font-size: small; color: #7f8c8d;">@{{ video.user }} | {{ video.date }}</p>
                                 <p style="font-size: small; color: #7f8c8d;">Statut : {{ video.status }}</p>
                                 {% if video.status == 'Converti' %}
-                                    <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download style="color: #4CAF50;">Télécharger</a>
+                                    <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download style="color: #4CAF50;">Télécharger (Simulé)</a>
                                 {% endif %}
                             </div>
                         </div>
                     {% endfor %}
                     {% if not uploaded_videos %}
-                        <p style="font-size: small; color: #7f8c8d;">Aucune vidéo publiée pour l'instant. Uploadez-en une !</p>
+                        <p style="font-size: small; color: #7f8c8d;">La fonctionnalité de conversion vidéo est désactivée pour le déploiement. Tentez l'inscription !</p>
                     {% endif %}
                 </div>
 
@@ -308,7 +304,7 @@ HTML_TEMPLATE = """
 """
 
 # --------------------------
-# 4. FONCTIONS DE CONVERSION (AJOUTÉES)
+# 4. FONCTIONS DE CONVERSION (SIMPLIFIÉES/DÉSACTIVÉES)
 # --------------------------
 
 def generate_unique_filename(extension):
@@ -316,18 +312,10 @@ def generate_unique_filename(extension):
     return f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{random.randint(1000, 9999)}.{extension}"
 
 def convert_to_mp4(input_path, output_dir):
-    """Convertit une vidéo en MP4 en utilisant FFmpeg."""
-    output_filename = generate_unique_filename('mp4')
-    output_path = os.path.join(output_dir, output_filename)
-    
-    try:
-        # L'utilisation de .run() exécute la commande FFmpeg
-        ffmpeg.input(input_path).output(output_path, vcodec='libx264', acodec='aac', strict='experimental').run(overwrite_output=True)
-        return output_filename
-    except Exception as e:
-        # Si le binaire FFmpeg n'est pas trouvé (Build Command échoué) ou autre erreur
-        print(f"Erreur de conversion FFmpeg: {e}")
-        return None
+    """Fonction de conversion DE-ACTIVÉE pour le déploiement sur Render."""
+    print("ATTENTION: FFmpeg est désactivé. Retourne un fichier de test.")
+    # Simule la conversion réussie
+    return "simulated_video.mp4" 
 
 # --------------------------
 # 5. ROUTES FLASK (LOGIQUE MISE À JOUR)
@@ -342,7 +330,6 @@ def index():
         with app.app_context():
             current_user = User.query.filter_by(username=current_username).first()
             if current_user:
-                # Utiliser .all() est nécessaire pour évaluer la requête des amis
                 friend_names = [f.username for f in current_user.friends.all()]
 
     return render_template_string(
@@ -368,7 +355,6 @@ def register():
             flash('Ce pseudo est déjà utilisé.', 'error')
             return redirect(url_for('index'))
 
-        # Utilisation de la fonction set_password pour hasher
         new_user = User(email=email, username=username)
         new_user.set_password(password)
         
@@ -388,7 +374,6 @@ def login():
     with app.app_context():
         user = User.query.filter_by(username=username).first()
 
-        # Utilisation de la fonction check_password
         if user and user.check_password(password):
             session['user_username'] = username
             session['user_email'] = user.email
@@ -429,12 +414,11 @@ def upload_file():
         try:
             file.save(file_path)
             
-            # --- CONVERSION ---
-            flash(f'Fichier "{title}" téléchargé. Début de la conversion...', 'info')
+            # --- CONVERSION (SIMULÉE) ---
+            flash(f'Fichier "{title}" téléchargé. Conversion SIMULÉE...', 'info')
             converted_filename = convert_to_mp4(file_path, 'converted')
             
-            # Suppression du fichier original après conversion (pour économiser de l'espace sur Render)
-            os.remove(file_path) 
+            # os.remove(file_path) # Retiré temporairement pour simplifier
             
             if converted_filename:
                 # Enregistrement dans la liste pour l'affichage
@@ -443,14 +427,14 @@ def upload_file():
                     'converted_filename': converted_filename,
                     'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                     'user': session['user_username'],
-                    'status': 'Converti'
+                    'status': 'Converti (Simulé)'
                 })
-                flash(f'"{title}" a été converti en MP4 et publié !', 'success')
+                flash(f'"{title}" a été simulé et publié !', 'success')
             else:
-                flash(f'Échec de la conversion de "{title}". (Vérifiez l\'installation de FFmpeg)', 'error')
+                flash(f'Échec de la simulation de conversion.', 'error')
 
         except Exception as e:
-            flash(f"Erreur lors de l'enregistrement ou de la conversion : {e}", 'error')
+            flash(f"Erreur lors de l'enregistrement : {e}", 'error')
 
         return redirect(url_for('index'))
     
@@ -460,7 +444,7 @@ def upload_file():
 
 @app.route('/download/<filename>')
 def download_file(filename):
-    """Permet de télécharger les fichiers convertis."""
+    """Permet de télécharger les fichiers convertis (simulé)."""
     return send_from_directory('converted', filename, as_attachment=True)
 
 
@@ -501,7 +485,6 @@ def forgot_password():
         user = User.query.filter_by(email=email).first()
 
         if user:
-            # --- SIMULATION DE L'ENVOI D'EMAIL ---
             print(f"\n--- SIMULATION EMAIL (MOT DE PASSE OUBLIÉ) ---")
             print(f"DESTINATAIRE : {email}")
             print(f"----------------------------------------------\n")
@@ -526,7 +509,6 @@ def handle_new_message(data):
         message_data = {'user': user, 'text': text}
         chat_messages.append(message_data)
         
-        # Envoi à tous les clients connectés
         emit('broadcast_message', message_data, broadcast=True)
 
 # --------------------------
@@ -534,6 +516,5 @@ def handle_new_message(data):
 # --------------------------
 
 if __name__ == '__main__':
-    # Ceci est utilisé pour le test local uniquement. Render utilisera gunicorn.
     PORT_CHOISI = 5003
     socketio.run(app, debug=True, port=PORT_CHOISI)
