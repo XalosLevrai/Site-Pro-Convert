@@ -7,7 +7,7 @@ import datetime
 import random
 import string
 import yt_dlp
-# import ffmpeg  # <-- DÉSACTIVÉ
+# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # --------------------------
@@ -16,19 +16,14 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-# LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT
+# LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT (CRUCIAL POUR RENDER)
 app.config['SECRET_KEY'] = os.environ.get(
     'SECRET_KEY', 
     'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod'
 )
 
-# Configuration de la base de données : UTILISATION FORCÉE DE POSTGRESQL
-# ---------------------------------------------------------------------
-# !!! REMPLACER PAR VOTRE URL POSTGRES COMPLÈTE (COMMENCE PAR postgres://) !!!
-HARDCODED_DATABASE_URL = "postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db" 
-# ---------------------------------------------------------------------
-
-database_url = HARDCODED_DATABASE_URL
+# Configuration de la base de données : UTILISATION DE POSTGRESQL (DATABASE_URL)
+database_url = os.environ.get('DATABASE_URL')
 
 # --- CORRECTION CRUCIALE POUR RENDER / SQLAlchemy ---
 # Si l'URL de connexion est fournie par Render au format 'postgres://', 
@@ -51,7 +46,7 @@ for folder in [app.config['UPLOAD_FOLDER'], 'converted']:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
-# Listes temporaires pour le contenu non stocké en DB
+# Listes temporaires pour le contenu non stocké en DB (non persistants après redémarrage)
 chat_messages = []
 uploaded_videos = []
 
@@ -102,9 +97,6 @@ class User(db.Model):
     def __repr__(self):
         return f"User('{self.username}')"
 
-# Création des tables de base de données si elles n'existent pas
-with app.app_context():
-    db.create_all()
 
 # --------------------------
 # 3. LE CODE HTML/CSS/JS INTÉGRÉ (Non modifié)
@@ -514,9 +506,24 @@ def handle_new_message(data):
         emit('broadcast_message', message_data, broadcast=True)
 
 # --------------------------
-# 7. LANCEMENT DU SERVEUR
+# 7. LANCEMENT ET INITIALISATION
 # --------------------------
 
+def initialize_database():
+    """Crée les tables de la base de données si elles n'existent pas."""
+    print("Tentative d'initialisation de la base de données...")
+    try:
+        with app.app_context():
+            # Force la vérification de la connexion ici
+            db.engine.connect() 
+            db.create_all()
+            print("Base de données initialisée avec succès.")
+    except Exception as e:
+        print(f"Erreur CRITIQUE lors de la connexion/initialisation de la DB: {e}")
+        # Cette erreur devrait s'afficher si la connexion PostgreSQL échoue
+        raise
+
 if __name__ == '__main__':
+    initialize_database()
     PORT_CHOISI = 5003
     socketio.run(app, debug=True, port=PORT_CHOISI)
