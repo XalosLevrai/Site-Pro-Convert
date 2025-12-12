@@ -7,7 +7,7 @@ import datetime
 import random
 import string
 import yt_dlp
-# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
+# import ffmpeg  # <-- DÉSACTIVÉ
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # --------------------------
@@ -16,14 +16,19 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-# LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT (CRUCIAL POUR RENDER)
+# LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT
 app.config['SECRET_KEY'] = os.environ.get(
     'SECRET_KEY', 
     'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod'
 )
 
-# Configuration de la base de données : UTILISATION DE POSTGRESQL (DATABASE_URL)
-database_url = os.environ.get('DATABASE_URL')
+# Configuration de la base de données : UTILISATION FORCÉE DE POSTGRESQL
+# ---------------------------------------------------------------------
+# !!! REMPLACER PAR VOTRE URL POSTGRES COMPLÈTE (COMMENCE PAR postgres://) !!!
+HARDCODED_DATABASE_URL = "postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db" 
+# ---------------------------------------------------------------------
+
+database_url = HARDCODED_DATABASE_URL
 
 # --- CORRECTION CRUCIALE POUR RENDER / SQLAlchemy ---
 # Si l'URL de connexion est fournie par Render au format 'postgres://', 
@@ -46,7 +51,7 @@ for folder in [app.config['UPLOAD_FOLDER'], 'converted']:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
-# Listes temporaires pour le contenu non stocké en DB (non persistants après redémarrage)
+# Listes temporaires pour le contenu non stocké en DB
 chat_messages = []
 uploaded_videos = []
 
@@ -314,7 +319,6 @@ def generate_unique_filename(extension):
 def convert_to_mp4(input_path, output_dir):
     """Fonction de conversion DE-ACTIVÉE pour le déploiement sur Render."""
     print("ATTENTION: FFmpeg est désactivé. Retourne un fichier de test.")
-    # Simule la conversion réussie
     return "simulated_video.mp4" 
 
 # --------------------------
@@ -417,8 +421,6 @@ def upload_file():
             # --- CONVERSION (SIMULÉE) ---
             flash(f'Fichier "{title}" téléchargé. Conversion SIMULÉE...', 'info')
             converted_filename = convert_to_mp4(file_path, 'converted')
-            
-            # os.remove(file_path) # Retiré temporairement pour simplifier
             
             if converted_filename:
                 # Enregistrement dans la liste pour l'affichage
