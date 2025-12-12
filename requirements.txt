@@ -5,7 +5,7 @@ Werkzeug
 Pillow
 yt-dlp
 gunicorn
-
+Flask-SocketIO
 # Remplacement de ffmpeg-python par python-ffmpeg pour Render
 python-ffmpeg
 pynacl
