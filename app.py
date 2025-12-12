@@ -23,8 +23,16 @@ app.config['SECRET_KEY'] = os.environ.get(
 )
 
 # Configuration de la base de données : UTILISATION DE POSTGRESQL (DATABASE_URL)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') 
-# Ligne de test pour forcer le push
+database_url = os.environ.get('DATABASE_URL')
+
+# --- CORRECTION CRUCIALE POUR RENDER / SQLAlchemy ---
+# Si l'URL de connexion est fournie par Render au format 'postgres://', 
+# SQLAlchemy (avec psycopg2) a besoin de 'postgresql://'.
+if database_url and database_url.startswith('postgres://'):
+    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False # Bonne pratique en production
 
 # Dossiers d'uploads
 app.config['UPLOAD_FOLDER'] = 'uploads'
@@ -57,7 +65,7 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     username = db.Column(db.String(80), unique=True, nullable=False)
     # Note : Le nom de colonne 'password' peut être un problème pour certains moteurs SQL. 
-    # Si le crash persiste, nous renommerons cette colonne en 'password_hash'.
+    # Le type string(128) est requis pour les hashs.
     password = db.Column(db.String(128), nullable=False) 
 
     # Relation d'Amis
@@ -101,7 +109,6 @@ with app.app_context():
 # 3. LE CODE HTML/CSS/JS INTÉGRÉ
 # --------------------------
 
-# (Le code HTML_TEMPLATE reste le même que précédemment)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -315,10 +322,10 @@ def convert_to_mp4(input_path, output_dir):
     
     try:
         # L'utilisation de .run() exécute la commande FFmpeg
-        # Remarque: Si 'ffmpeg' n'est pas trouvé, l'installation via le build command est cruciale.
         ffmpeg.input(input_path).output(output_path, vcodec='libx264', acodec='aac', strict='experimental').run(overwrite_output=True)
         return output_filename
     except Exception as e:
+        # Si le binaire FFmpeg n'est pas trouvé (Build Command échoué) ou autre erreur
         print(f"Erreur de conversion FFmpeg: {e}")
         return None
 
@@ -353,7 +360,6 @@ def register():
     password = request.form['password']
 
     with app.app_context():
-        # L'erreur "no such table" se produit souvent ICI !
         if User.query.filter_by(email=email).first():
             flash('Cet email est déjà enregistré.', 'error')
             return redirect(url_for('index'))
@@ -441,7 +447,7 @@ def upload_file():
                 })
                 flash(f'"{title}" a été converti en MP4 et publié !', 'success')
             else:
-                flash(f'Échec de la conversion de "{title}".', 'error')
+                flash(f'Échec de la conversion de "{title}". (Vérifiez l\'installation de FFmpeg)', 'error')
 
         except Exception as e:
             flash(f"Erreur lors de l'enregistrement ou de la conversion : {e}", 'error')
@@ -530,5 +536,4 @@ def handle_new_message(data):
 if __name__ == '__main__':
     # Ceci est utilisé pour le test local uniquement. Render utilisera gunicorn.
     PORT_CHOISI = 5003
-    # Note: Retirez debug=True en production pour des raisons de sécurité.
     socketio.run(app, debug=True, port=PORT_CHOISI)
