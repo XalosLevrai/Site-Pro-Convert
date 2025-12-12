@@ -9,3 +9,4 @@ gunicorn
 # Remplacement de ffmpeg-python par python-ffmpeg pour Render
 python-ffmpeg
 pynacl
+psycopg2-binary
