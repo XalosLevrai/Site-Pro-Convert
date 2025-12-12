@@ -23,7 +23,8 @@ app.config['SECRET_KEY'] = os.environ.get(
 )
 
 # Configuration de la base de données : UTILISATION DE POSTGRESQL (DATABASE_URL)
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') 
+# Ligne de test pour forcer le push
 
 # Dossiers d'uploads
 app.config['UPLOAD_FOLDER'] = 'uploads'
