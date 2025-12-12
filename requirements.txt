@@ -6,6 +6,8 @@ Pillow
 yt-dlp
 gunicorn
 Flask-SocketIO
+python-socketio
+python-engineio
 # Remplacement de ffmpeg-python par python-ffmpeg pour Render
 python-ffmpeg
 pynacl
