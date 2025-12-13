@@ -22,16 +22,14 @@ app.config['SECRET_KEY'] = os.environ.get(
     'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod'
 )
 
-# Configuration de la base de données : UTILISATION DE POSTGRESQL (DATABASE_URL)
-# TEMPORAIRE : Utilisation de l'URL "Hard-Codée" pour contourner le problème d'environnement de Render.
-# REMPLACER VOTRE_URL_POSTGRES_COPIEE_ICI par l'URL EXTERNE réelle.
-database_url = os.environ.get('DATABASE_URL', 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a/pro_convert_db')
+# VOTRE URL POSTGRES COPIÉE DE RENDER
+RAW_DATABASE_URL = 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db' 
 
-# --- CORRECTION CRUCIALE POUR RENDER / SQLAlchemy ---
-# Si l'URL de connexion est fournie par Render au format 'postgres://', 
-# SQLAlchemy (avec psycopg2) a besoin de 'postgresql://'.
-if database_url.startswith('postgres://'): # Ne vérifie plus si database_url existe car la valeur par défaut est toujours présente
-    database_url = database_url.replace('postgres://', 'postgresql://', 1)
+# Force la correction de l'URL pour SQLAlchemy (de postgres:// à postgresql://)
+if RAW_DATABASE_URL.startswith('postgres://'):
+    database_url = RAW_DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+else:
+    database_url = RAW_DATABASE_URL # Utilise l'URL si elle est déjà au format postgresql://
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False 
