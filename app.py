@@ -6,11 +6,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import datetime
 import random
-import string
-import secrets # Pour les jetons de sécurité
-import yt_dlp # Pour YouTube/TikTok
+import secrets # Pour les jetons de sécurité (CSRF)
 from PIL import Image # Pour la conversion GIF (Pillow)
-import time # Pour la simulation
 
 # --------------------------
 # 1. INITIALISATION ET CONFIG
@@ -25,9 +22,10 @@ app.config['SECRET_KEY'] = os.environ.get(
 )
 
 # VOTRE URL POSTGRES COPIÉE DE RENDER
-RAW_DATABASE_URL = 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db' 
+# ATTENTION: Remplacez ceci par votre véritable URL de base de données Render
+RAW_DATABASE_URL = 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHQXX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db' 
 
-# Correction du format de l'URL
+# Correction du format de l'URL pour SQLAlchemy
 if RAW_DATABASE_URL.startswith('postgres://'):
     database_url = RAW_DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 else:
@@ -49,16 +47,16 @@ for folder in [app.config['UPLOAD_FOLDER'], app.config['CONVERTED_FOLDER']]:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
-# Listes temporaires pour le contenu non stocké en DB (non persistants après redémarrage)
+# Listes temporaires pour le contenu (non persistants après redémarrage)
 chat_messages = []
-uploaded_videos = [] # Contient maintenant aussi les téléchargements externes
-uploaded_images = [] # Pour les conversions GIF
+uploaded_videos = [] 
+uploaded_images = [] 
 
 # Table pour garder la trace des utilisateurs connectés et de leur ID Socket
 user_sid_map = {} 
 
 # --------------------------
-# 2. MODÈLES DE BASE DE DONNÉES (AUCUN CHANGEMENT)
+# 2. MODÈLES DE BASE DE DONNÉES
 # --------------------------
 
 # Table d'association pour la relation plusieurs-à-plusieurs (Amis)
@@ -110,7 +108,7 @@ with app.app_context():
 
 
 # --------------------------
-# 3. LE CODE HTML/CSS/JS INTÉGRÉ (STYLE YOUTUBE AVEC NOUVEAUX FORMULAIRES)
+# 3. LE CODE HTML/CSS/JS INTÉGRÉ (MIS À JOUR)
 # --------------------------
 
 HTML_TEMPLATE = """
@@ -121,11 +119,10 @@ HTML_TEMPLATE = """
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
     <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
     <style>
-        /* Palette de couleurs YouTube: #282828 (Fonds sombres), #FFFFFF (Texte), #FF0000 (Rouge/Action) */
         @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
         body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: #181818; color: #FFFFFF; }
         
-        /* Header (Style YouTube Top Bar) */
+        /* Header */
         .header { background-color: #202020; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #303030; }
         .logo { font-size: 24px; font-weight: 700; color: #FFFFFF; }
         .logo span { color: #FF0000; margin-left: -4px; } 
@@ -133,7 +130,7 @@ HTML_TEMPLATE = """
         /* Conteneur principal */
         .main-layout { display: flex; max-width: 1600px; margin: 0 auto; }
 
-        /* Sidebar (Navigation/Connexion) */
+        /* Sidebar */
         .sidebar { width: 280px; background-color: #282828; padding: 20px 10px; box-sizing: border-box; height: 100vh; position: sticky; top: 0; border-right: 1px solid #303030; overflow-y: auto; }
         .sidebar h3 { color: #AAAAAA; font-size: 14px; margin-top: 20px; padding-bottom: 5px; border-bottom: 1px solid #303030; }
         .sidebar-item { padding: 10px 15px; border-radius: 5px; cursor: pointer; display: flex; align-items: center; font-size: 14px; transition: background-color 0.2s; }
@@ -142,10 +139,10 @@ HTML_TEMPLATE = """
         .sidebar p strong { color: #00AFFF; font-size: 1em; }
 
 
-        /* Contenu Principal (Fil d'Actualité) */
+        /* Contenu Principal */
         .content-area { flex-grow: 1; padding: 20px; }
         
-        /* Grille de Vidéos (YouTube Grid) */
+        /* Grille de Vidéos */
         .video-grid { 
             display: grid; 
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
@@ -175,7 +172,7 @@ HTML_TEMPLATE = """
 
 
         /* Formulaires et Boutons d'Action (Sidebar) */
-        .auth-form input, .upload-form input, .friend-form input, .util-form input, .util-form select { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; box-sizing: border-box; }
+        .auth-form input, .upload-form input, .friend-form input, .util-form input { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; box-sizing: border-box; }
         .auth-form button, .upload-form button, .friend-form button, .util-form button { width: 100%; padding: 10px; background-color: #FF0000; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: background-color 0.2s; margin-top: 5px;}
         .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .util-form button:hover { background-color: #CC0000; }
         
@@ -201,7 +198,7 @@ HTML_TEMPLATE = """
         <div class="logo">You<span>Tube</span> (Social Python)</div>
         {% if user_username %}
             <div class="user-action">
-                <span style="font-size: 14px; margin-right: 15px; color: #AAAAAA;">Jeton: {{ csrf_token[:6] }}...</span>
+                <span style="font-size: 14px; margin-right: 15px; color: #AAAAAA;">Jeton CSRF: {{ csrf_token[:6] }}...</span>
                 <span class="material-icons" style="color: white;">account_circle</span>
             </div>
         {% endif %}
@@ -224,19 +221,6 @@ HTML_TEMPLATE = """
                     <input type="text" name="title" placeholder="Titre de la vidéo" required>
                     <input type="file" name="file" required>
                     <button type="submit">Uploader & Publier</button>
-                </form>
-
-                <h3>TÉLÉCHARGEMENT EXTERNE</h3>
-                <form class="util-form" method="POST" action="{{ url_for('download_external_video') }}" style="padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="text" name="url" placeholder="Lien YouTube ou TikTok" required>
-                    <select name="quality" required>
-                        <option value="1080">1080p (HD)</option>
-                        <option value="720">720p</option>
-                        <option value="1440">2K (Simulé)</option>
-                        <option value="2160">4K (Simulé)</option>
-                    </select>
-                    <button type="submit" style="background-color: #00AFFF;">Télécharger & Publier</button>
                 </form>
 
                 <h3>UTILITAIRE</h3>
@@ -300,9 +284,9 @@ HTML_TEMPLATE = """
                                     <h4>{{ video.title }}</h4>
                                     <p>@{{ video.user }}</p>
                                     <p>{{ video.date }} | Statut: {{ video.status }}</p>
-                                    {% if video.status == 'Converti (Simulé)' or video.status.startswith('Téléchargé') %}
+                                    {% if video.status == 'Converti (Simulé)' %}
                                         <div class="video-status-download">
-                                            <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download>Télécharger ({{ video.quality | default('Standard') }})</a>
+                                            <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download>Télécharger</a>
                                         </div>
                                     {% endif %}
                                 </div>
@@ -310,7 +294,7 @@ HTML_TEMPLATE = """
                         </div>
                     {% endfor %}
                     {% if not uploaded_videos %}
-                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Utilisez le menu latéral pour uploader ou télécharger via lien.</p>
+                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Utilisez le menu latéral pour uploader votre propre vidéo.</p>
                     {% endif %}
                 </div>
                 
@@ -408,7 +392,9 @@ def generate_unique_filename(extension):
 
 def convert_to_mp4(input_path, output_dir):
     """Fonction de conversion DE-ACTIVÉE / SIMULÉE."""
-    print("ATTENTION: FFmpeg est désactivé. Retourne un fichier de test.")
+    # Cette simulation fonctionne pour les environnements légers, car elle n'appelle pas FFmpeg
+    # et crée juste un fichier "placeholder"
+    print("ATTENTION: La conversion FFmpeg est désactivée (pour l'hébergement gratuit). Retourne un fichier de test.")
     
     simulated_filename = "simulated_video_" + generate_unique_filename("mp4")
     try:
@@ -417,11 +403,16 @@ def convert_to_mp4(input_path, output_dir):
     except Exception as e:
         print(f"Erreur lors de la création du fichier simulé: {e}")
         return None
+    finally:
+        # Tente de supprimer le fichier original téléchargé après la simulation
+        if os.path.exists(input_path):
+             os.remove(input_path) 
         
     return simulated_filename
 
 def check_csrf_token(request):
-    """Vérifie si le jeton CSRF est valide."""
+    """Vérifie si le jeton CSRF est valide (sécurité anti-bot)."""
+    # Le jeton doit être présent dans le formulaire et correspondre à celui de la session
     return request.form.get('csrf_token') == session.get('csrf_token')
 
 
@@ -431,8 +422,9 @@ def check_csrf_token(request):
 
 @app.route('/', methods=['GET'])
 def index():
-    # Génère un nouveau jeton de sécurité (CSRF) ou le récupère
+    # 🍪 1. Gestion du Jeton CSRF
     if 'csrf_token' not in session:
+        # Création d'un jeton aléatoire sécurisé et stockage en session
         session['csrf_token'] = secrets.token_hex(16)
         
     current_username = session.get('user_username')
@@ -442,6 +434,7 @@ def index():
         with app.app_context():
             current_user = User.query.filter_by(username=current_username).first()
             if current_user:
+                # Récupère la liste des amis pour l'affichage
                 friend_names = [f.username for f in current_user.friends.all()]
 
     return render_template_string(
@@ -451,13 +444,14 @@ def index():
         uploaded_videos=uploaded_videos,
         uploaded_images=uploaded_images,
         friend_names=friend_names,
-        csrf_token=session['csrf_token']
+        csrf_token=session['csrf_token'] # Passe le jeton à l'HTML pour les formulaires
     )
 
 @app.route('/register', methods=['POST'])
 def register():
+    # 🔒 2. Vérification du jeton CSRF
     if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer (token invalide).', 'error')
+        flash('Erreur de sécurité: Jeton invalide. Veuillez réessayer.', 'error')
         return redirect(url_for('index'))
         
     email = request.form['email']
@@ -480,14 +474,14 @@ def register():
         db.session.commit()
         
         session['user_username'] = username
-        session['user_email'] = email
         flash(f'Compte créé et connexion réussie pour @{username}!', 'success')
         return redirect(url_for('index'))
 
 @app.route('/login', methods=['POST'])
 def login():
+    # 🔒 2. Vérification du jeton CSRF
     if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer (token invalide).', 'error')
+        flash('Erreur de sécurité: Jeton invalide. Veuillez réessayer.', 'error')
         return redirect(url_for('index'))
         
     username = request.form['username']
@@ -498,7 +492,6 @@ def login():
 
         if user and user.check_password(password):
             session['user_username'] = username
-            session['user_email'] = user.email
             flash(f'Connexion réussie pour @{username}!', 'success')
         else:
             flash('Pseudo ou mot de passe incorrect.', 'error')
@@ -507,19 +500,20 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    # 🔒 2. Vérification du jeton CSRF
     if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        flash('Erreur de sécurité: Jeton invalide. Veuillez réessayer.', 'error')
         return redirect(url_for('index'))
         
     session.pop('user_username', None)
-    session.pop('user_email', None)
     flash('Vous êtes déconnecté.', 'success')
     return redirect(url_for('index'))
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
+    # 🔒 2. Vérification du jeton CSRF
     if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        flash('Erreur de sécurité: Jeton invalide. Veuillez réessayer.', 'error')
         return redirect(url_for('index'))
 
     if 'user_username' not in session:
@@ -542,10 +536,10 @@ def upload_file():
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
         try:
+            # Sauvegarde du fichier temporairement dans /uploads
             file.save(file_path)
             
             # --- CONVERSION (SIMULÉE) ---
-            flash(f'Fichier "{title}" téléchargé. Conversion SIMULÉE...', 'info')
             converted_filename = convert_to_mp4(file_path, app.config['CONVERTED_FOLDER'])
             
             if converted_filename:
@@ -554,15 +548,14 @@ def upload_file():
                     'converted_filename': converted_filename,
                     'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                     'user': session['user_username'],
-                    'status': 'Converti (Simulé)',
-                    'quality': 'Standard'
+                    'status': 'Converti (Simulé)'
                 })
                 flash(f'"{title}" a été simulé et publié !', 'success')
             else:
                 flash(f'Échec de la simulation de conversion.', 'error')
 
         except Exception as e:
-            flash(f"Erreur lors de l'enregistrement : {e}", 'error')
+            flash(f"Erreur lors de l'enregistrement ou la simulation: {e}", 'error')
 
         return redirect(url_for('index'))
     
@@ -570,63 +563,11 @@ def upload_file():
     return redirect(url_for('index'))
 
 
-@app.route('/download_external', methods=['POST'])
-def download_external_video():
-    if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
-        return redirect(url_for('index'))
-
-    if 'user_username' not in session:
-        flash('Veuillez vous connecter pour télécharger des vidéos externes.', 'error')
-        return redirect(url_for('index'))
-
-    url = request.form['url']
-    quality = request.form['quality'] # 720, 1080, 1440, 2160
-
-    if not url.startswith(('http', 'https')):
-        flash("L'URL doit commencer par http:// ou https://", 'error')
-        return redirect(url_for('index'))
-
-    try:
-        # --- UTILISATION DE YT-DLP (MOCKÉE) ---
-        ydl_opts = {
-            'noplaylist': True,
-            'quiet': True,
-            'simulate': True, # ON SIMULE LE TÉLÉCHARGEMENT pour éviter l'échec de FFMPEG
-            'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]',
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info_dict = ydl.extract_info(url, download=False)
-            video_title = info_dict.get('title', 'Vidéo externe sans titre')
-        
-        # Simuler le temps de téléchargement/conversion
-        time.sleep(2) 
-        
-        # Simuler le fichier de sortie
-        converted_filename = f"dl_{quality}p_" + generate_unique_filename("mp4")
-        with open(os.path.join(app.config['CONVERTED_FOLDER'], converted_filename), 'w') as f:
-            f.write(f"Ceci est un fichier vidéo simulé téléchargé en {quality}p.")
-
-        uploaded_videos.append({
-            'title': video_title,
-            'converted_filename': converted_filename,
-            'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
-            'user': session['user_username'],
-            'status': f'Téléchargé ({quality}p)',
-            'quality': f'{quality}p'
-        })
-        flash(f'Vidéo "{video_title}" téléchargée et publiée en {quality}p (simulé)!', 'success')
-        
-    except Exception as e:
-        flash(f"Échec du téléchargement via lien (erreur: {e}). Assurez-vous que le lien est valide.", 'error')
-        
-    return redirect(url_for('index'))
-
 @app.route('/convert_gif', methods=['POST'])
 def convert_gif():
+    # 🔒 2. Vérification du jeton CSRF
     if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        flash('Erreur de sécurité: Jeton invalide. Veuillez réessayer.', 'error')
         return redirect(url_for('index'))
 
     if 'user_username' not in session:
@@ -638,7 +579,7 @@ def convert_gif():
         return redirect(url_for('index'))
 
     file = request.files['gif_file']
-    if not file.filename.lower().endswith('.gif'):
+    if not file.filename or not file.filename.lower().endswith('.gif'):
         flash("Seuls les fichiers GIF sont supportés.", 'error')
         return redirect(url_for('index'))
 
@@ -648,13 +589,12 @@ def convert_gif():
         gif_path = os.path.join(app.config['UPLOAD_FOLDER'], gif_filename)
         file.save(gif_path)
 
-        # --- CONVERSION AVEC PILLOW ---
+        # --- CONVERSION AVEC PILLOW (Légère) ---
         output_filename = generate_unique_filename("png")
         output_path = os.path.join(app.config['CONVERTED_FOLDER'], output_filename)
         
         img = Image.open(gif_path)
-        # Prendre la première image du GIF
-        img.seek(0) 
+        img.seek(0) # Prendre la première image du GIF
         img.save(output_path, 'PNG')
         
         # Suppression du GIF original temporaire
@@ -676,18 +616,21 @@ def convert_gif():
 @app.route('/download/<filename>')
 def download_file(filename):
     """Permet de télécharger les fichiers convertis (vidéos)."""
+    # Ce répertoire contiendra les fichiers mp4 (simulés)
     return send_from_directory(app.config['CONVERTED_FOLDER'], filename, as_attachment=True)
 
 @app.route('/converted_images/<filename>')
 def download_converted_image(filename):
     """Affiche les images converties (GIF)."""
+    # Ce répertoire contiendra les fichiers png issus de la conversion
     return send_from_directory(app.config['CONVERTED_FOLDER'], filename)
 
 
 @app.route('/add_friend', methods=['POST'])
 def add_friend():
+    # 🔒 2. Vérification du jeton CSRF
     if not check_csrf_token(request):
-        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        flash('Erreur de sécurité: Jeton invalide. Veuillez réessayer.', 'error')
         return redirect(url_for('index'))
         
     if 'user_username' not in session:
@@ -787,4 +730,5 @@ def handle_new_message(data):
 
 if __name__ == '__main__':
     PORT_CHOISI = 5003 
+    # Pour le déploiement sur Render, assurez-vous que debug=False et que la clé secrète est dans l'environnement.
     socketio.run(app, debug=True, port=PORT_CHOISI)
