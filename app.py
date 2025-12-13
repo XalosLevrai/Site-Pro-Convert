@@ -8,7 +8,7 @@ import datetime
 import random
 import string
 import yt_dlp
-# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
+# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
 
 # --------------------------
 # 1. INITIALISATION ET CONFIG
@@ -36,7 +36,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Dossiers d'uploads
 app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Limite d'upload à 100MB
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Limite d'upload à 100MB
 
 db = SQLAlchemy(app)
 socketio = SocketIO(app)
@@ -49,6 +49,10 @@ for folder in [app.config['UPLOAD_FOLDER'], 'converted']:
 # Listes temporaires pour le contenu non stocké en DB (non persistants après redémarrage)
 chat_messages = []
 uploaded_videos = []
+
+# Table pour garder la trace des utilisateurs connectés et de leur ID Socket
+# Format : {user_id: socket_id}
+user_sid_map = {} 
 
 # --------------------------
 # 2. MODÈLES DE BASE DE DONNÉES (PSEUDO, EMAIL ET AMIS)
@@ -90,10 +94,7 @@ class User(db.Model):
 
     def is_friend(self, user):
         with app.app_context():
-            return db.session.query(friends).filter(
-                friends.c.user_id == self.id, 
-                friends.c.friend_id == user.id
-            ).count() > 0
+            return self.friends.filter(friends.c.friend_id == user.id).count() > 0
 
     def __repr__(self):
         return f"User('{self.username}')"
@@ -101,218 +102,262 @@ class User(db.Model):
 # --------------------------
 # CORRECTION DÉPLOIEMENT : CRÉATION DE TABLES FORCÉE
 # --------------------------
-# Ce bloc est CRUCIAL. Il assure que les tables DB sont créées 
-# dès que le module 'app' est chargé, contournant les problèmes de Gunicorn/Render.
 with app.app_context():
     print("Tentative de CRÉATION des tables via app_context (fix UndefinedTable)...")
     try:
-        # Ceci crée les tables s'ils n'existent pas
         db.create_all() 
         print("Tables de la base de données créées/vérifiées avec succès.")
     except Exception as e:
         print(f"Échec de la création des tables lors du démarrage: {e}")
-        # On log l'erreur mais on ne bloque pas le démarrage de l'application
 # --------------------------
 
 
 # --------------------------
-# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Interface utilisateur)
+# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Interface utilisateur - STYLE YOUTUBE)
 # --------------------------
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Mon Réseau Social Python</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <style>
-        /* CSS V3: Plus Stylé et Moderne */
-        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
-        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: #f0f2f5; color: #1c1e21; }
-        .container { display: flex; max-width: 1400px; margin: 40px auto; background: #ffffff; border-radius: 18px; box-shadow: 0 12px 24px rgba(0, 0, 0, 0.1); min-height: 85vh; overflow: hidden; }
-        .sidebar { width: 320px; background-color: #294a73; color: white; padding: 30px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between; }
-        .main-content { flex-grow: 1; padding: 30px; }
-        h1, h2, h3 { color: #294a73; margin-bottom: 15px; }
-        h2 { border-bottom: 2px solid #5a82a0; padding-bottom: 10px; }
-        
-        /* Formulaires */
-        .auth-form input, .upload-form input, .friend-form input { width: 100%; padding: 14px; margin-bottom: 15px; border: none; border-radius: 8px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1); background: #f7f7f7; font-size: 16px; }
-        .auth-form button, .upload-form button, .friend-form button, .reset-button { width: 100%; padding: 14px; background-color: #4CAF50; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 700; transition: background-color 0.3s; margin-top: 5px;}
-        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .reset-button:hover { background-color: #45a049; }
-        
-        /* Connexion/Déconnexion */
-        .sidebar p strong { color: #ffeb3b; font-size: 1.1em; }
-        .sidebar .logout-button { background-color: #e74c3c; margin-top: 20px; }
-        .sidebar .logout-button:hover { background-color: #c0392b; }
+    <title>YouTube Python Social</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <style>
+        /* Palette de couleurs YouTube: #282828 (Fonds sombres), #FFFFFF (Texte), #FF0000 (Rouge/Action) */
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: #181818; color: #FFFFFF; }
+        
+        /* Header (Style YouTube Top Bar) */
+        .header { background-color: #202020; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #303030; }
+        .logo { font-size: 24px; font-weight: 700; color: #FFFFFF; }
+        .logo span { color: #FF0000; margin-left: -4px; } /* Pour le style "YouTUBE" */
 
-        /* Messages Flash */
-        .flash { padding: 15px; margin-bottom: 20px; border-radius: 8px; font-weight: bold; }
-        .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .info { background-color: #cce5ff; color: #004085; border: 1px solid #b8daff; }
+        /* Conteneur principal */
+        .main-layout { display: flex; max-width: 1600px; margin: 0 auto; }
 
-        /* Chat */
-        .chat-box { height: 400px; border: 1px solid #ddd; overflow-y: scroll; padding: 15px; margin-bottom: 15px; background-color: #fcfcfc; border-radius: 8px; }
-        .message-input { display: flex; }
-        .message-input input { flex-grow: 1; margin-right: 10px; }
-        .user-pseudo { font-weight: 700; color: #3498db; margin-right: 8px; }
+        /* Sidebar (Navigation/Connexion) */
+        .sidebar { width: 240px; background-color: #282828; padding: 20px 10px; box-sizing: border-box; height: 100vh; position: sticky; top: 0; border-right: 1px solid #303030; }
+        .sidebar h3 { color: #AAAAAA; font-size: 14px; margin-top: 20px; padding-bottom: 5px; border-bottom: 1px solid #303030; }
+        .sidebar-item { padding: 10px 15px; border-radius: 5px; cursor: pointer; display: flex; align-items: center; font-size: 14px; transition: background-color 0.2s; }
+        .sidebar-item:hover { background-color: #383838; }
+        .sidebar-item .material-icons { margin-right: 15px; font-size: 20px; color: #909090; }
+        .sidebar p strong { color: #00AFFF; font-size: 1em; }
 
-        /* Vidéos */
-        .video-grid { display: flex; flex-wrap: wrap; gap: 25px; margin-top: 25px; }
-        .video-item { width: calc(33.333% - 17px); background: #f9f9f9; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 8px rgba(0,0,0,0.05); }
-        .video-item img { width: 100%; height: 180px; object-fit: cover; background-color: #34495e; display: block; border-bottom: 2px solid #5a82a0; }
-        .video-details { padding: 15px; }
-    </style>
+
+        /* Contenu Principal (Fil d'Actualité) */
+        .content-area { flex-grow: 1; padding: 20px; }
+        
+        /* Grille de Vidéos (YouTube Grid) */
+        .video-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
+            gap: 20px; 
+            margin-top: 20px; 
+        }
+        .video-item { color: #FFFFFF; }
+        .thumbnail-placeholder { width: 100%; height: 180px; background-color: #303030; display: flex; align-items: center; justify-content: center; border-radius: 8px; margin-bottom: 10px; position: relative; overflow: hidden;}
+        .thumbnail-placeholder text { fill: #AAAAAA; font-size: 18px; }
+        .video-details { display: flex; }
+        .video-info { margin-left: 10px; }
+        .video-info h4 { font-size: 16px; font-weight: 500; margin: 0 0 5px 0; line-height: 1.3; }
+        .video-info p { font-size: 12px; color: #AAAAAA; margin: 0; }
+        .channel-icon { width: 36px; height: 36px; background: #FF0000; border-radius: 50%; flex-shrink: 0; }
+
+        /* Chat Box (Style Dark Mode) */
+        .chat-container { margin-top: 40px; padding-top: 20px; border-top: 1px solid #303030; }
+        .chat-box { height: 300px; border: 1px solid #404040; overflow-y: scroll; padding: 15px; margin-bottom: 15px; background-color: #202020; border-radius: 8px; }
+        .message { margin-bottom: 8px; }
+        .user-pseudo { font-weight: 500; color: #4CAF50; margin-right: 8px; } /* Vert pour les utilisateurs */
+        .message-input { display: flex; }
+        .message-input input { flex-grow: 1; margin-right: 10px; background: #303030; border: 1px solid #404040; color: #FFFFFF; padding: 10px; border-radius: 4px; }
+        .message-input button { background-color: #FF0000; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; transition: background-color 0.2s; }
+        .message-input button:hover { background-color: #CC0000; }
+
+
+        /* Formulaires et Boutons d'Action (Sidebar) */
+        .auth-form input, .upload-form input, .friend-form input { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; }
+        .auth-form button, .upload-form button, .friend-form button, .reset-button { width: 100%; padding: 10px; background-color: #FF0000; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: background-color 0.2s; margin-top: 5px;}
+        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .reset-button:hover { background-color: #CC0000; }
+        
+        .logout-button { background-color: #555555 !important; }
+        .logout-button:hover { background-color: #666666 !important; }
+
+        /* Messages Flash */
+        .flash { padding: 15px; margin-bottom: 20px; border-radius: 4px; font-weight: bold; }
+        .success { background-color: #4CAF50; color: white; }
+        .error { background-color: #FF5555; color: white; }
+        .info { background-color: #3498db; color: white; }
+        
+        .section-title { color: #FFFFFF; font-size: 20px; font-weight: 500; margin-top: 30px; margin-bottom: 15px; }
+    </style>
 </head>
 <body>
-    <div class="container">
-        <div class="sidebar">
-            <div>
-                <h2 style="color: #ffeb3b; border-bottom-color: #5a82a0;">Hub Social Python</h2>
-                {% if user_username %}
-                    <p style="margin-top: 10px;">Connecté en tant que: <br><strong style="color: #ffeb3b;">@{{ user_username }}</strong></p>
-                    
-                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Ajouter un Ami</h3>
-                    <form class="friend-form" method="POST" action="{{ url_for('add_friend') }}">
-                        <input type="text" name="friend_username" placeholder="Pseudo de l'ami" required>
-                        <button type="submit">Ajouter l'Ami</button>
-                    </form>
+    <div class="header">
+        <div class="logo">You<span>Tube</span> (Social Python)</div>
+        {% if user_username %}
+            <div class="user-action">
+                <span class="material-icons" style="color: white; margin-right: 15px;">notifications</span>
+                <span class="material-icons" style="color: white;">account_circle</span>
+            </div>
+        {% endif %}
+    </div>
 
-                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Publier (Vidéo)</h3>
-                    <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data">
-                        <input type="text" name="title" placeholder="Titre de la vidéo" required>
-                        <input type="file" name="file" required>
-                        <button type="submit">Uploader Vidéo</button>
-                    </form>
-                    
-                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Mot de Passe</h3>
-                    <p style="font-size: small; color: #bdc3c7;">
-                        <button class="reset-button" style="background-color: #f39c12;" onclick="document.getElementById('reset-form').style.display='block'">Réinitialiser</button>
-                    </p>
-                    <form id="reset-form" method="POST" action="{{ url_for('forgot_password') }}" style="display:none; margin-top: 10px;">
-                        <input type="email" name="email" placeholder="Votre Email" required>
-                        <button type="submit">Envoyer Lien</button>
-                    </form>
+    <div class="main-layout">
+        <div class="sidebar">
+            <div class="sidebar-item" onclick="window.location.href='/'">
+                <span class="material-icons">home</span> Accueil
+            </div>
+            <div class="sidebar-item">
+                <span class="material-icons">explore</span> Explorer
+            </div>
+            <div class="sidebar-item">
+                <span class="material-icons">subscriptions</span> Amis (Abonnements)
+            </div>
 
-                {% else %}
-                    <h3 style="color: white;">Créer un compte</h3>
-                    <form class="auth-form" method="POST" action="{{ url_for('register') }}">
-                        <input type="email" name="email" placeholder="Email (Unique)" required>
-                        <input type="text" name="username" placeholder="Pseudo (Unique)" required>
-                        <input type="password" name="password" placeholder="Mot de passe" required>
-                        <button type="submit">S'inscrire</button>
-                    </form>
-                    <h3 style="color: white; margin-top: 25px;">Se connecter</h3>
-                    <form class="auth-form" method="POST" action="{{ url_for('login') }}">
-                        <input type="text" name="username" placeholder="Pseudo" required>
-                        <input type="password" name="password" placeholder="Mot de passe" required>
-                        <button type="submit">Connexion</button>
-                    </form>
-                {% endif %}
-            </div>
+            {% if user_username %}
+                <h3>VOTRE COMPTE</h3>
+                <p style="padding: 10px 15px; font-size: 14px;">Connecté: <br><strong>@{{ user_username }}</strong></p>
+                
+                <h3>ACTIONS RAPIDES</h3>
+                <form class="friend-form" method="POST" action="{{ url_for('add_friend') }}" style="padding: 10px 0;">
+                    <input type="text" name="friend_username" placeholder="Pseudo de l'ami" required>
+                    <button type="submit" style="background-color: #2ECC71;">Ajouter Ami</button>
+                </form>
+                
+                <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" style="padding: 10px 0;">
+                    <input type="text" name="title" placeholder="Titre de la vidéo" required>
+                    <input type="file" name="file" required>
+                    <button type="submit">Uploader Vidéo</button>
+                </form>
 
-            {% if user_username %}
-            <form method="POST" action="{{ url_for('logout') }}" style="margin-top: 20px;">
-                <button type="submit" class="logout-button">Déconnexion</button>
-            </form>
-            {% endif %}
-        </div>
-        
-        <div class="main-content">
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="flash {{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
+                <form method="POST" action="{{ url_for('logout') }}" style="margin-top: 20px; padding: 10px 0;">
+                    <button type="submit" class="logout-button">Déconnexion</button>
+                </form>
 
-            {% if user_username %}
-                <h2>👥 Amis Connectés</h2>
-                <p>Liste des amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
-                {% if not friend_names %}<p style="font-size: small; color: #7f8c8d;">Ajoutez des amis via la barre latérale.</p>{% endif %}
+            {% else %}
+                <h3>CONNEXION / INSCRIPTION</h3>
+                <form class="auth-form" method="POST" action="{{ url_for('register') }}" style="padding: 10px 0;">
+                    <input type="email" name="email" placeholder="Email" required>
+                    <input type="text" name="username" placeholder="Pseudo" required>
+                    <input type="password" name="password" placeholder="Mot de passe" required>
+                    <button type="submit">S'inscrire</button>
+                </form>
+                <form class="auth-form" method="POST" action="{{ url_for('login') }}" style="padding: 10px 0;">
+                    <input type="text" name="username" placeholder="Pseudo" required>
+                    <input type="password" name="password" placeholder="Mot de passe" required>
+                    <button type="submit">Connexion</button>
+                </form>
+            {% endif %}
+        </div>
+        
+        <div class="content-area">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="flash {{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
 
-                <h2 style="margin-top: 40px;">💬 Messagerie Temps Réel</h2>
-                <div class="chat-box" id="messages">
-                    {% for msg in chat_messages %}
-                        <div class="message"><span class="user-pseudo">@{{ msg.user }}</span>: {{ msg.text }}</div>
-                    {% endfor %}
-                </div>
-                <div class="message-input">
-                    <input type="text" id="message_input" placeholder="Envoyer un message texte (pas vocal/appel)">
-                    <button onclick="sendMessage()">Envoyer</button>
-                </div>
-                
-                <h2 style="margin-top: 40px;">📼 Fil d'Actualité Vidéo (Fonctionnalité désactivée)</h2>
-                <div class="video-grid">
-                    {% for video in uploaded_videos %}
-                        <div class="video-item">
-                            <img src="data:image/svg+xml;charset=UTF-8,%3Csvg%20width%3D%22300%22%20height%3D%22180%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20300%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Crect%20width%3D%22300%22%20height%3D%22180%22%20fill%3D%22%23294a73%22%3E%3C%2Frect%3E%3Ctext%20x%3D%2250%25%22%20y%3D%2250%25%22%20fill%3D%22%23f0f2f5%22%20font-family%3D%22sans-serif%22%20font-size%3D%2220%22%20text-anchor%3D%22middle%22%3E{{ video.title }}%3C%2Ftext%3E%3C%2Fsvg%3E" alt="Miniature">
-                            <div class="video-details">
-                                <h4>{{ video.title }}</h4>
-                                <p style="font-size: small; color: #7f8c8d;">@{{ video.user }} | {{ video.date }}</p>
-                                <p style="font-size: small; color: #7f8c8d;">Statut : {{ video.status }}</p>
-                                {% if video.status == 'Converti (Simulé)' %}
-                                    <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download style="color: #4CAF50;">Télécharger (Simulé)</a>
-                                {% endif %}
-                            </div>
-                        </div>
-                    {% endfor %}
-                    {% if not uploaded_videos %}
-                        <p style="font-size: small; color: #7f8c8d;">La fonctionnalité de conversion vidéo est désactivée pour le déploiement. Tentez l'inscription !</p>
-                    {% endif %}
-                </div>
+            {% if user_username %}
 
-                <script>
-                    var socket = io();
-                    var user_username = "{{ user_username }}";
+                <h2 class="section-title">En Tendances (Fil Vidéo Simulé)</h2>
+                <div class="video-grid">
+                    {% for video in uploaded_videos %}
+                        <div class="video-item">
+                            <div class="thumbnail-placeholder">
+                                <img src="data:image/svg+xml;charset=UTF-8,%3Csvg%20width%3D%22300%22%20height%3D%22180%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20300%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Crect%20width%3D%22300%22%20height%3D%22180%22%20fill%3D%22%23303030%22%3E%3C%2Frect%3E%3Ctext%20x%3D%2250%25%22%20y%3D%2250%25%22%20fill%3D%22%23AAAAAA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2218%22%20text-anchor%3D%22middle%22%3E{{ video.title }}%3C%2Ftext%3E%3C%2Fsvg%3E" alt="Miniature">
+                            </div>
+                            <div class="video-details">
+                                <div class="channel-icon"></div>
+                                <div class="video-info">
+                                    <h4>{{ video.title }}</h4>
+                                    <p>@{{ video.user }}</p>
+                                    <p>{{ video.date }} | Statut: {{ video.status }}</p>
+                                    {% if video.status == 'Converti (Simulé)' %}
+                                        <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download style="color: #FF0000; font-weight: 500;">Télécharger (Simulé)</a>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </div>
+                    {% endfor %}
+                    {% if not uploaded_videos %}
+                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Uploadez un fichier via le menu latéral.</p>
+                    {% endif %}
+                </div>
+                
+                <div class="chat-container">
+                    <h2 class="section-title">💬 Messagerie Privée (Amis uniquement)</h2>
+                    <p style="font-size: small; color: #AAAAAA; margin-bottom: 10px;">Liste des amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
+                    <div class="chat-box" id="messages">
+                        {% for msg in chat_messages %}
+                            <div class="message"><span class="user-pseudo">@{{ msg.user }}</span>: {{ msg.text }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="message-input">
+                        <input type="text" id="message_input" placeholder="Envoyer un message à vos amis...">
+                        <button onclick="sendMessage()">Envoyer</button>
+                    </div>
+                </div>
 
-                    // --- Réception de messages ---
-                    socket.on('broadcast_message', function(data) {
-                        var messagesDiv = document.getElementById('messages');
-                        var div = document.createElement('div');
-                        div.className = 'message';
-                        div.innerHTML = '<span class="user-pseudo">@' + data.user + '</span>: ' + data.text;
-                        messagesDiv.appendChild(div);
-                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    });
+                <script>
+                    var socket = io();
+                    var user_username = "{{ user_username }}";
 
-                    // --- Envoi de messages ---
-                    function sendMessage() {
-                        var input = document.getElementById('message_input');
-                        var content = input.value;
+                    // --- Réception de messages ---
+                    socket.on('broadcast_message', function(data) {
+                        var messagesDiv = document.getElementById('messages');
+                        var div = document.createElement('div');
+                        div.className = 'message';
+                                    
+                        // Afficher les messages système en rouge si l'utilisateur est 'Système'
+                        if (data.user === 'Système') {
+                            div.innerHTML = '<span style="font-weight: 700; color: #FF0000;">[' + data.user + ']</span>: ' + data.text;
+                        } else {
+                            div.innerHTML = '<span class="user-pseudo">@' + data.user + '</span>: ' + data.text;
+                        }
+                        
+                        messagesDiv.appendChild(div);
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    });
 
-                        if (content && user_username) {
-                            socket.emit('new_message', {
-                                user: user_username,
-                                text: content
-                            });
-                            input.value = '';
-                        }
-                    }
+                    // --- Envoi de messages ---
+                    function sendMessage() {
+                        var input = document.getElementById('message_input');
+                        var content = input.value;
 
-                    // Envoyer avec la touche Entrée
-                    document.getElementById('message_input').addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter') {
-                            sendMessage();
-                        }
-                    });
+                        if (content && user_username) {
+                            socket.emit('new_message', {
+                                user: user_username,
+                                text: content
+                            });
+                            input.value = '';
+                        }
+                    }
 
-                    // Scroll au bas au chargement
-                    document.addEventListener('DOMContentLoaded', (event) => {
-                        var messagesDiv = document.getElementById('messages');
-                        if (messagesDiv) {
-                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                        }
-                    });
-                </script>
+                    // Envoyer avec la touche Entrée
+                    document.getElementById('message_input').addEventListener('keypress', function(e) {
+                        if (e.key === 'Enter') {
+                            sendMessage();
+                        }
+                    });
 
-            {% else %}
-                <h2 style="text-align: center; color: #294a73;">Bienvenue sur votre Réseau Social Python!</h2>
-                <p style="text-align: center; color: #7f8c8d; margin-top: 20px;">Veuillez vous inscrire avec votre email et un pseudo unique pour commencer à interagir.</p>
-            {% endif %}
-        </div>
-    </div>
+                    // Scroll au bas au chargement
+                    document.addEventListener('DOMContentLoaded', (event) => {
+                        var messagesDiv = document.getElementById('messages');
+                        if (messagesDiv) {
+                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        }
+                    });
+                </script>
+
+            {% else %}
+                <h1 style="text-align: center; color: #FFFFFF; margin-top: 50px;">Bienvenue sur YouTube Social Python!</h1>
+                <p style="text-align: center; color: #AAAAAA; margin-top: 20px;">Utilisez le panneau de gauche pour vous inscrire ou vous connecter.</p>
+            {% endif %}
+        </div>
+    </div>
 </body>
 </html>
 """
@@ -353,6 +398,7 @@ def index():
         with app.app_context():
             current_user = User.query.filter_by(username=current_username).first()
             if current_user:
+                # Récupère les noms des amis pour l'affichage dans l'interface
                 friend_names = [f.username for f in current_user.friends.all()]
 
     return render_template_string(
@@ -370,7 +416,6 @@ def register():
     password = request.form['password']
 
     with app.app_context():
-        # L'erreur UndefinedTable se produit ici si la table n'est pas créée
         if User.query.filter_by(email=email).first():
             flash('Cet email est déjà enregistré.', 'error')
             return redirect(url_for('index'))
@@ -519,19 +564,71 @@ def forgot_password():
 
 
 # --------------------------
-# 6. SOCKETIO (CHAT EN TEMPS RÉEL)
+# 6. SOCKETIO (CHAT EN TEMPS RÉEL - LOGIQUE AMIS)
 # --------------------------
+
+@socketio.on('connect')
+def handle_connect():
+    current_username = session.get('user_username')
+    if current_username:
+        with app.app_context():
+            user = User.query.filter_by(username=current_username).first()
+            if user:
+                # Stocke l'ID du socket pour l'envoi de messages privés
+                user_sid_map[user.id] = request.sid
+                print(f"User @{current_username} connected with SID: {request.sid}")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    current_username = session.get('user_username')
+    if current_username:
+        with app.app_context():
+            user = User.query.filter_by(username=current_username).first()
+            # Supprime l'utilisateur de la map s'il est déconnecté
+            if user and user.id in user_sid_map and user_sid_map[user.id] == request.sid:
+                del user_sid_map[user.id]
+                print(f"User @{current_username} disconnected.")
+
 
 @socketio.on('new_message')
 def handle_new_message(data):
-    user = session.get('user_username', 'Anonyme')
+    """
+    Réceptionne le message, le stocke et l'émet UNIQUEMENT aux amis de l'expéditeur
+    qui sont actuellement connectés.
+    """
+    user_username = session.get('user_username', 'Anonyme')
     text = data.get('text', '...')
     
-    if text and user != 'Anonyme':
-        message_data = {'user': user, 'text': text}
-        chat_messages.append(message_data)
-        
-        emit('broadcast_message', message_data, broadcast=True)
+    if text and user_username != 'Anonyme':
+        with app.app_context():
+            sender = User.query.filter_by(username=user_username).first()
+            
+            if not sender:
+                # L'utilisateur de la session n'existe plus en DB
+                return 
+
+            message_data = {'user': user_username, 'text': text}
+            chat_messages.append(message_data)
+            
+            # 1. Émettre le message à l'expéditeur lui-même (confirmation)
+            emit('broadcast_message', message_data, room=request.sid)
+
+            # 2. Émettre le message à chaque ami connecté
+            friends_list = sender.friends.all()
+
+            for friend in friends_list:
+                friend_id = friend.id
+                friend_sid = user_sid_map.get(friend_id)
+
+                if friend_sid:
+                    # Émet le message uniquement au socket de cet ami
+                    emit('broadcast_message', message_data, room=friend_sid)
+                    print(f"Message de @{user_username} envoyé à @{friend.username}.")
+    else:
+        # Émettre un message d'erreur à l'expéditeur
+        error_data = {'user': 'Système', 'text': 'Veuillez vous connecter pour parler.'}
+        emit('broadcast_message', error_data, room=request.sid)
+
 
 # --------------------------
 # 7. LANCEMENT 
