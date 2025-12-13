@@ -7,8 +7,10 @@ import os
 import datetime
 import random
 import string
-import yt_dlp
-# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
+import secrets # Pour les jetons de sécurité
+import yt_dlp # Pour YouTube/TikTok
+from PIL import Image # Pour la conversion GIF (Pillow)
+import time # Pour la simulation
 
 # --------------------------
 # 1. INITIALISATION ET CONFIG
@@ -36,26 +38,27 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Dossiers d'uploads
 app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['CONVERTED_FOLDER'] = 'converted'
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Limite d'upload à 100MB
 
 db = SQLAlchemy(app)
 socketio = SocketIO(app)
 
 # Créer les dossiers nécessaires s'ils n'existent pas
-for folder in [app.config['UPLOAD_FOLDER'], 'converted']:
+for folder in [app.config['UPLOAD_FOLDER'], app.config['CONVERTED_FOLDER']]:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
 # Listes temporaires pour le contenu non stocké en DB (non persistants après redémarrage)
 chat_messages = []
-uploaded_videos = []
+uploaded_videos = [] # Contient maintenant aussi les téléchargements externes
+uploaded_images = [] # Pour les conversions GIF
 
 # Table pour garder la trace des utilisateurs connectés et de leur ID Socket
-# Format : {user_id: socket_id}
 user_sid_map = {} 
 
 # --------------------------
-# 2. MODÈLES DE BASE DE DONNÉES (PSEUDO, EMAIL ET AMIS)
+# 2. MODÈLES DE BASE DE DONNÉES (AUCUN CHANGEMENT)
 # --------------------------
 
 # Table d'association pour la relation plusieurs-à-plusieurs (Amis)
@@ -68,10 +71,8 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    # Taille augmentée pour le hash de mot de passe
     password = db.Column(db.String(256), nullable=False) 
 
-    # Relation d'Amis
     friends = db.relationship(
         'User', 
         secondary=friends,
@@ -99,21 +100,17 @@ class User(db.Model):
     def __repr__(self):
         return f"User('{self.username}')"
 
-# --------------------------
-# CORRECTION DÉPLOIEMENT : CRÉATION DE TABLES FORCÉE
-# --------------------------
+# Création des tables au démarrage
 with app.app_context():
-    print("Tentative de CRÉATION des tables via app_context (fix UndefinedTable)...")
     try:
         db.create_all() 
         print("Tables de la base de données créées/vérifiées avec succès.")
     except Exception as e:
         print(f"Échec de la création des tables lors du démarrage: {e}")
-# --------------------------
 
 
 # --------------------------
-# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Interface utilisateur - STYLE YOUTUBE)
+# 3. LE CODE HTML/CSS/JS INTÉGRÉ (STYLE YOUTUBE AVEC NOUVEAUX FORMULAIRES)
 # --------------------------
 
 HTML_TEMPLATE = """
@@ -131,13 +128,13 @@ HTML_TEMPLATE = """
         /* Header (Style YouTube Top Bar) */
         .header { background-color: #202020; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #303030; }
         .logo { font-size: 24px; font-weight: 700; color: #FFFFFF; }
-        .logo span { color: #FF0000; margin-left: -4px; } /* Pour le style "YouTUBE" */
+        .logo span { color: #FF0000; margin-left: -4px; } 
 
         /* Conteneur principal */
         .main-layout { display: flex; max-width: 1600px; margin: 0 auto; }
 
         /* Sidebar (Navigation/Connexion) */
-        .sidebar { width: 240px; background-color: #282828; padding: 20px 10px; box-sizing: border-box; height: 100vh; position: sticky; top: 0; border-right: 1px solid #303030; }
+        .sidebar { width: 280px; background-color: #282828; padding: 20px 10px; box-sizing: border-box; height: 100vh; position: sticky; top: 0; border-right: 1px solid #303030; overflow-y: auto; }
         .sidebar h3 { color: #AAAAAA; font-size: 14px; margin-top: 20px; padding-bottom: 5px; border-bottom: 1px solid #303030; }
         .sidebar-item { padding: 10px 15px; border-radius: 5px; cursor: pointer; display: flex; align-items: center; font-size: 14px; transition: background-color 0.2s; }
         .sidebar-item:hover { background-color: #383838; }
@@ -157,18 +154,20 @@ HTML_TEMPLATE = """
         }
         .video-item { color: #FFFFFF; }
         .thumbnail-placeholder { width: 100%; height: 180px; background-color: #303030; display: flex; align-items: center; justify-content: center; border-radius: 8px; margin-bottom: 10px; position: relative; overflow: hidden;}
-        .thumbnail-placeholder text { fill: #AAAAAA; font-size: 18px; }
+        .thumbnail-placeholder img { width: 100%; height: 100%; object-fit: cover; }
         .video-details { display: flex; }
         .video-info { margin-left: 10px; }
         .video-info h4 { font-size: 16px; font-weight: 500; margin: 0 0 5px 0; line-height: 1.3; }
         .video-info p { font-size: 12px; color: #AAAAAA; margin: 0; }
         .channel-icon { width: 36px; height: 36px; background: #FF0000; border-radius: 50%; flex-shrink: 0; }
+        .video-status-download a { color: #00BFFF; font-weight: 500; text-decoration: none; }
+        .video-status-download a:hover { text-decoration: underline; }
 
-        /* Chat Box (Style Dark Mode) */
+        /* Chat Box */
         .chat-container { margin-top: 40px; padding-top: 20px; border-top: 1px solid #303030; }
         .chat-box { height: 300px; border: 1px solid #404040; overflow-y: scroll; padding: 15px; margin-bottom: 15px; background-color: #202020; border-radius: 8px; }
         .message { margin-bottom: 8px; }
-        .user-pseudo { font-weight: 500; color: #4CAF50; margin-right: 8px; } /* Vert pour les utilisateurs */
+        .user-pseudo { font-weight: 500; color: #4CAF50; margin-right: 8px; } 
         .message-input { display: flex; }
         .message-input input { flex-grow: 1; margin-right: 10px; background: #303030; border: 1px solid #404040; color: #FFFFFF; padding: 10px; border-radius: 4px; }
         .message-input button { background-color: #FF0000; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; transition: background-color 0.2s; }
@@ -176,9 +175,9 @@ HTML_TEMPLATE = """
 
 
         /* Formulaires et Boutons d'Action (Sidebar) */
-        .auth-form input, .upload-form input, .friend-form input { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; }
-        .auth-form button, .upload-form button, .friend-form button, .reset-button { width: 100%; padding: 10px; background-color: #FF0000; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: background-color 0.2s; margin-top: 5px;}
-        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .reset-button:hover { background-color: #CC0000; }
+        .auth-form input, .upload-form input, .friend-form input, .util-form input, .util-form select { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; box-sizing: border-box; }
+        .auth-form button, .upload-form button, .friend-form button, .util-form button { width: 100%; padding: 10px; background-color: #FF0000; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: background-color 0.2s; margin-top: 5px;}
+        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .util-form button:hover { background-color: #CC0000; }
         
         .logout-button { background-color: #555555 !important; }
         .logout-button:hover { background-color: #666666 !important; }
@@ -190,6 +189,11 @@ HTML_TEMPLATE = """
         .info { background-color: #3498db; color: white; }
         
         .section-title { color: #FFFFFF; font-size: 20px; font-weight: 500; margin-top: 30px; margin-bottom: 15px; }
+
+        /* Liste des images GIF converties */
+        .image-grid { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 20px; }
+        .image-item { width: 150px; text-align: center; }
+        .image-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 4px; border: 1px solid #303030; }
     </style>
 </head>
 <body>
@@ -197,7 +201,7 @@ HTML_TEMPLATE = """
         <div class="logo">You<span>Tube</span> (Social Python)</div>
         {% if user_username %}
             <div class="user-action">
-                <span class="material-icons" style="color: white; margin-right: 15px;">notifications</span>
+                <span style="font-size: 14px; margin-right: 15px; color: #AAAAAA;">Jeton: {{ csrf_token[:6] }}...</span>
                 <span class="material-icons" style="color: white;">account_circle</span>
             </div>
         {% endif %}
@@ -208,42 +212,63 @@ HTML_TEMPLATE = """
             <div class="sidebar-item" onclick="window.location.href='/'">
                 <span class="material-icons">home</span> Accueil
             </div>
-            <div class="sidebar-item">
-                <span class="material-icons">explore</span> Explorer
-            </div>
-            <div class="sidebar-item">
-                <span class="material-icons">subscriptions</span> Amis (Abonnements)
-            </div>
-
+            
             {% if user_username %}
                 <h3>VOTRE COMPTE</h3>
                 <p style="padding: 10px 15px; font-size: 14px;">Connecté: <br><strong>@{{ user_username }}</strong></p>
                 
-                <h3>ACTIONS RAPIDES</h3>
+                <h3>ACTIONS VIDÉO</h3>
+                
+                <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="text" name="title" placeholder="Titre de la vidéo" required>
+                    <input type="file" name="file" required>
+                    <button type="submit">Uploader & Publier</button>
+                </form>
+
+                <h3>TÉLÉCHARGEMENT EXTERNE</h3>
+                <form class="util-form" method="POST" action="{{ url_for('download_external_video') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="text" name="url" placeholder="Lien YouTube ou TikTok" required>
+                    <select name="quality" required>
+                        <option value="1080">1080p (HD)</option>
+                        <option value="720">720p</option>
+                        <option value="1440">2K (Simulé)</option>
+                        <option value="2160">4K (Simulé)</option>
+                    </select>
+                    <button type="submit" style="background-color: #00AFFF;">Télécharger & Publier</button>
+                </form>
+
+                <h3>UTILITAIRE</h3>
+                <form class="util-form" method="POST" action="{{ url_for('convert_gif') }}" enctype="multipart/form-data" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="file" name="gif_file" accept=".gif" required>
+                    <button type="submit" style="background-color: #9B59B6;">Convertir GIF -> PNG</button>
+                </form>
+                
+                <h3>GESTION AMIS</h3>
                 <form class="friend-form" method="POST" action="{{ url_for('add_friend') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <input type="text" name="friend_username" placeholder="Pseudo de l'ami" required>
                     <button type="submit" style="background-color: #2ECC71;">Ajouter Ami</button>
                 </form>
-                
-                <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" style="padding: 10px 0;">
-                    <input type="text" name="title" placeholder="Titre de la vidéo" required>
-                    <input type="file" name="file" required>
-                    <button type="submit">Uploader Vidéo</button>
-                </form>
 
                 <form method="POST" action="{{ url_for('logout') }}" style="margin-top: 20px; padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <button type="submit" class="logout-button">Déconnexion</button>
                 </form>
 
             {% else %}
                 <h3>CONNEXION / INSCRIPTION</h3>
                 <form class="auth-form" method="POST" action="{{ url_for('register') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <input type="email" name="email" placeholder="Email" required>
                     <input type="text" name="username" placeholder="Pseudo" required>
                     <input type="password" name="password" placeholder="Mot de passe" required>
                     <button type="submit">S'inscrire</button>
                 </form>
                 <form class="auth-form" method="POST" action="{{ url_for('login') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                     <input type="text" name="username" placeholder="Pseudo" required>
                     <input type="password" name="password" placeholder="Mot de passe" required>
                     <button type="submit">Connexion</button>
@@ -262,9 +287,9 @@ HTML_TEMPLATE = """
 
             {% if user_username %}
 
-                <h2 class="section-title">En Tendances (Fil Vidéo Simulé)</h2>
+                <h2 class="section-title">En Tendances (Vidéos Publiées)</h2>
                 <div class="video-grid">
-                    {% for video in uploaded_videos %}
+                    {% for video in uploaded_videos | reverse %}
                         <div class="video-item">
                             <div class="thumbnail-placeholder">
                                 <img src="data:image/svg+xml;charset=UTF-8,%3Csvg%20width%3D%22300%22%20height%3D%22180%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20300%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Crect%20width%3D%22300%22%20height%3D%22180%22%20fill%3D%22%23303030%22%3E%3C%2Frect%3E%3Ctext%20x%3D%2250%25%22%20y%3D%2250%25%22%20fill%3D%22%23AAAAAA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2218%22%20text-anchor%3D%22middle%22%3E{{ video.title }}%3C%2Ftext%3E%3C%2Fsvg%3E" alt="Miniature">
@@ -275,21 +300,33 @@ HTML_TEMPLATE = """
                                     <h4>{{ video.title }}</h4>
                                     <p>@{{ video.user }}</p>
                                     <p>{{ video.date }} | Statut: {{ video.status }}</p>
-                                    {% if video.status == 'Converti (Simulé)' %}
-                                        <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download style="color: #FF0000; font-weight: 500;">Télécharger (Simulé)</a>
+                                    {% if video.status == 'Converti (Simulé)' or video.status.startswith('Téléchargé') %}
+                                        <div class="video-status-download">
+                                            <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download>Télécharger ({{ video.quality | default('Standard') }})</a>
+                                        </div>
                                     {% endif %}
                                 </div>
                             </div>
                         </div>
                     {% endfor %}
                     {% if not uploaded_videos %}
-                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Uploadez un fichier via le menu latéral.</p>
+                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Utilisez le menu latéral pour uploader ou télécharger via lien.</p>
                     {% endif %}
+                </div>
+                
+                <h2 class="section-title" style="margin-top: 50px;">🖼️ Conversions GIF récentes</h2>
+                <div class="image-grid">
+                    {% for img in uploaded_images | reverse %}
+                        <div class="image-item">
+                            <img src="{{ url_for('download_converted_image', filename=img.filename) }}" alt="Image convertie">
+                            <a href="{{ url_for('download_converted_image', filename=img.filename) }}" download style="font-size: 12px; color: #AAAAAA;">Télécharger {{ img.format }}</a>
+                        </div>
+                    {% endfor %}
                 </div>
                 
                 <div class="chat-container">
                     <h2 class="section-title">💬 Messagerie Privée (Amis uniquement)</h2>
-                    <p style="font-size: small; color: #AAAAAA; margin-bottom: 10px;">Liste des amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
+                    <p style="font-size: small; color: #AAAAAA; margin-bottom: 10px;">Amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
                     <div class="chat-box" id="messages">
                         {% for msg in chat_messages %}
                             <div class="message"><span class="user-pseudo">@{{ msg.user }}</span>: {{ msg.text }}</div>
@@ -311,7 +348,6 @@ HTML_TEMPLATE = """
                         var div = document.createElement('div');
                         div.className = 'message';
                                     
-                        // Afficher les messages système en rouge si l'utilisateur est 'Système'
                         if (data.user === 'Système') {
                             div.innerHTML = '<span style="font-weight: 700; color: #FF0000;">[' + data.user + ']</span>: ' + data.text;
                         } else {
@@ -363,7 +399,7 @@ HTML_TEMPLATE = """
 """
 
 # --------------------------
-# 4. FONCTIONS DE CONVERSION (SIMPLIFIÉES/DÉSACTIVÉES)
+# 4. FONCTIONS UTILITAIRES ET DE SÉCURITÉ
 # --------------------------
 
 def generate_unique_filename(extension):
@@ -371,11 +407,10 @@ def generate_unique_filename(extension):
     return f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{random.randint(1000, 9999)}.{extension}"
 
 def convert_to_mp4(input_path, output_dir):
-    """Fonction de conversion DE-ACTIVÉE pour le déploiement sur Render."""
+    """Fonction de conversion DE-ACTIVÉE / SIMULÉE."""
     print("ATTENTION: FFmpeg est désactivé. Retourne un fichier de test.")
-    # Simuler la création d'un fichier de sortie
+    
     simulated_filename = "simulated_video_" + generate_unique_filename("mp4")
-    # Créer un fichier bidon pour simuler la conversion
     try:
         with open(os.path.join(output_dir, simulated_filename), 'w') as f:
             f.write("Ceci est un fichier vidéo simulé.")
@@ -385,12 +420,21 @@ def convert_to_mp4(input_path, output_dir):
         
     return simulated_filename
 
+def check_csrf_token(request):
+    """Vérifie si le jeton CSRF est valide."""
+    return request.form.get('csrf_token') == session.get('csrf_token')
+
+
 # --------------------------
-# 5. ROUTES FLASK (LOGIQUE MISE À JOUR)
+# 5. ROUTES FLASK
 # --------------------------
 
 @app.route('/', methods=['GET'])
 def index():
+    # Génère un nouveau jeton de sécurité (CSRF) ou le récupère
+    if 'csrf_token' not in session:
+        session['csrf_token'] = secrets.token_hex(16)
+        
     current_username = session.get('user_username')
     friend_names = []
     
@@ -398,7 +442,6 @@ def index():
         with app.app_context():
             current_user = User.query.filter_by(username=current_username).first()
             if current_user:
-                # Récupère les noms des amis pour l'affichage dans l'interface
                 friend_names = [f.username for f in current_user.friends.all()]
 
     return render_template_string(
@@ -406,11 +449,17 @@ def index():
         user_username=current_username,
         chat_messages=chat_messages,
         uploaded_videos=uploaded_videos,
-        friend_names=friend_names
+        uploaded_images=uploaded_images,
+        friend_names=friend_names,
+        csrf_token=session['csrf_token']
     )
 
 @app.route('/register', methods=['POST'])
 def register():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer (token invalide).', 'error')
+        return redirect(url_for('index'))
+        
     email = request.form['email']
     username = request.form['username']
     password = request.form['password']
@@ -437,6 +486,10 @@ def register():
 
 @app.route('/login', methods=['POST'])
 def login():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer (token invalide).', 'error')
+        return redirect(url_for('index'))
+        
     username = request.form['username']
     password = request.form['password']
 
@@ -454,6 +507,10 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        return redirect(url_for('index'))
+        
     session.pop('user_username', None)
     session.pop('user_email', None)
     flash('Vous êtes déconnecté.', 'success')
@@ -461,6 +518,10 @@ def logout():
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        return redirect(url_for('index'))
+
     if 'user_username' not in session:
         flash('Veuillez vous connecter pour publier du contenu.', 'error')
         return redirect(url_for('index'))
@@ -485,16 +546,16 @@ def upload_file():
             
             # --- CONVERSION (SIMULÉE) ---
             flash(f'Fichier "{title}" téléchargé. Conversion SIMULÉE...', 'info')
-            converted_filename = convert_to_mp4(file_path, 'converted')
+            converted_filename = convert_to_mp4(file_path, app.config['CONVERTED_FOLDER'])
             
             if converted_filename:
-                # Enregistrement dans la liste pour l'affichage
                 uploaded_videos.append({
                     'title': title,
                     'converted_filename': converted_filename,
                     'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                     'user': session['user_username'],
-                    'status': 'Converti (Simulé)'
+                    'status': 'Converti (Simulé)',
+                    'quality': 'Standard'
                 })
                 flash(f'"{title}" a été simulé et publié !', 'success')
             else:
@@ -509,14 +570,126 @@ def upload_file():
     return redirect(url_for('index'))
 
 
+@app.route('/download_external', methods=['POST'])
+def download_external_video():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        return redirect(url_for('index'))
+
+    if 'user_username' not in session:
+        flash('Veuillez vous connecter pour télécharger des vidéos externes.', 'error')
+        return redirect(url_for('index'))
+
+    url = request.form['url']
+    quality = request.form['quality'] # 720, 1080, 1440, 2160
+
+    if not url.startswith(('http', 'https')):
+        flash("L'URL doit commencer par http:// ou https://", 'error')
+        return redirect(url_for('index'))
+
+    try:
+        # --- UTILISATION DE YT-DLP (MOCKÉE) ---
+        ydl_opts = {
+            'noplaylist': True,
+            'quiet': True,
+            'simulate': True, # ON SIMULE LE TÉLÉCHARGEMENT pour éviter l'échec de FFMPEG
+            'format': f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]',
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info_dict = ydl.extract_info(url, download=False)
+            video_title = info_dict.get('title', 'Vidéo externe sans titre')
+        
+        # Simuler le temps de téléchargement/conversion
+        time.sleep(2) 
+        
+        # Simuler le fichier de sortie
+        converted_filename = f"dl_{quality}p_" + generate_unique_filename("mp4")
+        with open(os.path.join(app.config['CONVERTED_FOLDER'], converted_filename), 'w') as f:
+            f.write(f"Ceci est un fichier vidéo simulé téléchargé en {quality}p.")
+
+        uploaded_videos.append({
+            'title': video_title,
+            'converted_filename': converted_filename,
+            'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            'user': session['user_username'],
+            'status': f'Téléchargé ({quality}p)',
+            'quality': f'{quality}p'
+        })
+        flash(f'Vidéo "{video_title}" téléchargée et publiée en {quality}p (simulé)!', 'success')
+        
+    except Exception as e:
+        flash(f"Échec du téléchargement via lien (erreur: {e}). Assurez-vous que le lien est valide.", 'error')
+        
+    return redirect(url_for('index'))
+
+@app.route('/convert_gif', methods=['POST'])
+def convert_gif():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        return redirect(url_for('index'))
+
+    if 'user_username' not in session:
+        flash('Veuillez vous connecter pour utiliser le convertisseur.', 'error')
+        return redirect(url_for('index'))
+
+    if 'gif_file' not in request.files:
+        flash('Aucun fichier GIF sélectionné.', 'error')
+        return redirect(url_for('index'))
+
+    file = request.files['gif_file']
+    if not file.filename.lower().endswith('.gif'):
+        flash("Seuls les fichiers GIF sont supportés.", 'error')
+        return redirect(url_for('index'))
+
+    try:
+        # Enregistrer le fichier GIF temporairement
+        gif_filename = secure_filename(file.filename)
+        gif_path = os.path.join(app.config['UPLOAD_FOLDER'], gif_filename)
+        file.save(gif_path)
+
+        # --- CONVERSION AVEC PILLOW ---
+        output_filename = generate_unique_filename("png")
+        output_path = os.path.join(app.config['CONVERTED_FOLDER'], output_filename)
+        
+        img = Image.open(gif_path)
+        # Prendre la première image du GIF
+        img.seek(0) 
+        img.save(output_path, 'PNG')
+        
+        # Suppression du GIF original temporaire
+        os.remove(gif_path) 
+        
+        uploaded_images.append({
+            'filename': output_filename,
+            'format': 'PNG',
+            'user': session['user_username']
+        })
+        flash(f'Conversion GIF -> PNG réussie! Téléchargez l\'image.', 'success')
+
+    except Exception as e:
+        flash(f"Erreur de conversion GIF : {e}", 'error')
+
+    return redirect(url_for('index'))
+
+
 @app.route('/download/<filename>')
 def download_file(filename):
-    """Permet de télécharger les fichiers convertis (simulé)."""
-    return send_from_directory('converted', filename, as_attachment=True)
+    """Permet de télécharger les fichiers convertis (vidéos)."""
+    return send_from_directory(app.config['CONVERTED_FOLDER'], filename, as_attachment=True)
+
+@app.route('/converted_images/<filename>')
+def download_converted_image(filename):
+    """Affiche les images converties (GIF)."""
+    return send_from_directory(app.config['CONVERTED_FOLDER'], filename)
 
 
 @app.route('/add_friend', methods=['POST'])
 def add_friend():
+    if not check_csrf_token(request):
+        flash('Erreur de sécurité. Veuillez réessayer.', 'error')
+        return redirect(url_for('index'))
+        
     if 'user_username' not in session:
         flash('Veuillez vous connecter pour ajouter des amis.', 'error')
         return redirect(url_for('index'))
@@ -544,27 +717,8 @@ def add_friend():
     return redirect(url_for('index'))
 
 
-@app.route('/forgot_password', methods=['POST'])
-def forgot_password():
-    email = request.form['email']
-    
-    with app.app_context():
-        user = User.query.filter_by(email=email).first()
-
-        if user:
-            print(f"\n--- SIMULATION EMAIL (MOT DE PASSE OUBLIÉ) ---")
-            print(f"DESTINATAIRE : {email}")
-            print(f"----------------------------------------------\n")
-            
-            flash('Un lien de réinitialisation de mot de passe a été (simulé) envoyé à votre email.', 'info')
-        else:
-            flash("Aucun compte trouvé avec cet email.", 'error')
-            
-        return redirect(url_for('index'))
-
-
 # --------------------------
-# 6. SOCKETIO (CHAT EN TEMPS RÉEL - LOGIQUE AMIS)
+# 6. SOCKETIO (CHAT PRIVÉ)
 # --------------------------
 
 @socketio.on('connect')
@@ -593,8 +747,7 @@ def handle_disconnect():
 @socketio.on('new_message')
 def handle_new_message(data):
     """
-    Réceptionne le message, le stocke et l'émet UNIQUEMENT aux amis de l'expéditeur
-    qui sont actuellement connectés.
+    Réceptionne le message et l'émet UNIQUEMENT aux amis connectés.
     """
     user_username = session.get('user_username', 'Anonyme')
     text = data.get('text', '...')
@@ -604,7 +757,6 @@ def handle_new_message(data):
             sender = User.query.filter_by(username=user_username).first()
             
             if not sender:
-                # L'utilisateur de la session n'existe plus en DB
                 return 
 
             message_data = {'user': user_username, 'text': text}
@@ -617,15 +769,14 @@ def handle_new_message(data):
             friends_list = sender.friends.all()
 
             for friend in friends_list:
-                friend_id = friend.id
-                friend_sid = user_sid_map.get(friend_id)
+                friend_sid = user_sid_map.get(friend.id)
 
                 if friend_sid:
                     # Émet le message uniquement au socket de cet ami
                     emit('broadcast_message', message_data, room=friend_sid)
                     print(f"Message de @{user_username} envoyé à @{friend.username}.")
     else:
-        # Émettre un message d'erreur à l'expéditeur
+        # Message d'erreur à l'expéditeur
         error_data = {'user': 'Système', 'text': 'Veuillez vous connecter pour parler.'}
         emit('broadcast_message', error_data, room=request.sid)
 
