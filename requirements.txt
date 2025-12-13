@@ -1,13 +1,7 @@
 Flask
-Flask-SQLAlchemy
-Flask-Login
-Werkzeug
-Pillow
-yt-dlp
-gunicorn
 Flask-SocketIO
-python-socketio
-python-engineio
-python-ffmpeg
-pynacl
-psycopg2-binary
+Flask-SQLAlchemy
+Pillow
+Werkzeug
+gunicorn # Nécessaire pour Render pour servir l'application
+psycopg2-binary # Pour la connexion PostgreSQL
