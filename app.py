@@ -6,26 +6,31 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import os
 import datetime
 import random
-import secrets # Pour les jetons de sécurité (CSRF)
-from PIL import Image # Pour la conversion GIF (Pillow)
+import secrets 
+from PIL import Image 
 
 # --------------------------
 # 1. INITIALISATION ET CONFIG
 # --------------------------
 
+# IMPORTANT : Le mode asynchrone est crucial pour la compatibilité avec Flask-SocketIO et gunicorn.
+# Utiliser 'gevent' ou 'eventlet' (ici, nous partons du principe que vous utiliserez un worker gevent/eventlet avec gunicorn).
 app = Flask(__name__)
 
 # LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT
 app.config['SECRET_KEY'] = os.environ.get(
     'SECRET_KEY', 
-    'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod'
+    'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod' # Changez ceci en production!
 )
 
 # VOTRE URL POSTGRES COPIÉE DE RENDER
 # ATTENTION: Remplacez ceci par votre véritable URL de base de données Render
-RAW_DATABASE_URL = 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHQXX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db' 
+RAW_DATABASE_URL = os.environ.get(
+    'DATABASE_URL', 
+    'postgresql://pro_convert_db_user:votre_mot_de_passe@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db'
+)
 
-# Correction du format de l'URL pour SQLAlchemy
+# Correction du format de l'URL pour SQLAlchemy (si l'URL commence par 'postgres://')
 if RAW_DATABASE_URL.startswith('postgres://'):
     database_url = RAW_DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 else:
@@ -37,10 +42,12 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Dossiers d'uploads
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['CONVERTED_FOLDER'] = 'converted'
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Limite d'upload à 100MB
+# CORRECTION DU CARACTÈRE U+00A0 (espace insécable)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024 # Limite d'upload à 100MB
 
 db = SQLAlchemy(app)
-socketio = SocketIO(app)
+# SocketIO initialisé sans app context pour permettre la configuration de gunicorn
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Créer les dossiers nécessaires s'ils n'existent pas
 for folder in [app.config['UPLOAD_FOLDER'], app.config['CONVERTED_FOLDER']]:
@@ -98,7 +105,7 @@ class User(db.Model):
     def __repr__(self):
         return f"User('{self.username}')"
 
-# Création des tables au démarrage
+# Création des tables au démarrage (s'assure que le contexte est là pour la DB)
 with app.app_context():
     try:
         db.create_all() 
@@ -115,269 +122,272 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>YouTube Python Social</title>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
-        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: #181818; color: #FFFFFF; }
-        
-        /* Header */
-        .header { background-color: #202020; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #303030; }
-        .logo { font-size: 24px; font-weight: 700; color: #FFFFFF; }
-        .logo span { color: #FF0000; margin-left: -4px; } 
+    <title>YouTube Python Social</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: #181818; color: #FFFFFF; }
+        
+        /* Header */
+        .header { background-color: #202020; padding: 10px 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #303030; }
+        .logo { font-size: 24px; font-weight: 700; color: #FFFFFF; }
+        .logo span { color: #FF0000; margin-left: -4px; } 
 
-        /* Conteneur principal */
-        .main-layout { display: flex; max-width: 1600px; margin: 0 auto; }
+        /* Conteneur principal */
+        .main-layout { display: flex; max-width: 1600px; margin: 0 auto; }
 
-        /* Sidebar */
-        .sidebar { width: 280px; background-color: #282828; padding: 20px 10px; box-sizing: border-box; height: 100vh; position: sticky; top: 0; border-right: 1px solid #303030; overflow-y: auto; }
-        .sidebar h3 { color: #AAAAAA; font-size: 14px; margin-top: 20px; padding-bottom: 5px; border-bottom: 1px solid #303030; }
-        .sidebar-item { padding: 10px 15px; border-radius: 5px; cursor: pointer; display: flex; align-items: center; font-size: 14px; transition: background-color 0.2s; }
-        .sidebar-item:hover { background-color: #383838; }
-        .sidebar-item .material-icons { margin-right: 15px; font-size: 20px; color: #909090; }
-        .sidebar p strong { color: #00AFFF; font-size: 1em; }
-
-
-        /* Contenu Principal */
-        .content-area { flex-grow: 1; padding: 20px; }
-        
-        /* Grille de Vidéos */
-        .video-grid { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
-            gap: 20px; 
-            margin-top: 20px; 
-        }
-        .video-item { color: #FFFFFF; }
-        .thumbnail-placeholder { width: 100%; height: 180px; background-color: #303030; display: flex; align-items: center; justify-content: center; border-radius: 8px; margin-bottom: 10px; position: relative; overflow: hidden;}
-        .thumbnail-placeholder img { width: 100%; height: 100%; object-fit: cover; }
-        .video-details { display: flex; }
-        .video-info { margin-left: 10px; }
-        .video-info h4 { font-size: 16px; font-weight: 500; margin: 0 0 5px 0; line-height: 1.3; }
-        .video-info p { font-size: 12px; color: #AAAAAA; margin: 0; }
-        .channel-icon { width: 36px; height: 36px; background: #FF0000; border-radius: 50%; flex-shrink: 0; }
-        .video-status-download a { color: #00BFFF; font-weight: 500; text-decoration: none; }
-        .video-status-download a:hover { text-decoration: underline; }
-
-        /* Chat Box */
-        .chat-container { margin-top: 40px; padding-top: 20px; border-top: 1px solid #303030; }
-        .chat-box { height: 300px; border: 1px solid #404040; overflow-y: scroll; padding: 15px; margin-bottom: 15px; background-color: #202020; border-radius: 8px; }
-        .message { margin-bottom: 8px; }
-        .user-pseudo { font-weight: 500; color: #4CAF50; margin-right: 8px; } 
-        .message-input { display: flex; }
-        .message-input input { flex-grow: 1; margin-right: 10px; background: #303030; border: 1px solid #404040; color: #FFFFFF; padding: 10px; border-radius: 4px; }
-        .message-input button { background-color: #FF0000; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; transition: background-color 0.2s; }
-        .message-input button:hover { background-color: #CC0000; }
+        /* Sidebar */
+        .sidebar { width: 280px; background-color: #282828; padding: 20px 10px; box-sizing: border-box; height: 100vh; position: sticky; top: 0; border-right: 1px solid #303030; overflow-y: auto; }
+        .sidebar h3 { color: #AAAAAA; font-size: 14px; margin-top: 20px; padding-bottom: 5px; border-bottom: 1px solid #303030; }
+        .sidebar-item { padding: 10px 15px; border-radius: 5px; cursor: pointer; display: flex; align-items: center; font-size: 14px; transition: background-color 0.2s; }
+        .sidebar-item:hover { background-color: #383838; }
+        .sidebar-item .material-icons { margin-right: 15px; font-size: 20px; color: #909090; }
+        .sidebar p strong { color: #00AFFF; font-size: 1em; }
 
 
-        /* Formulaires et Boutons d'Action (Sidebar) */
-        .auth-form input, .upload-form input, .friend-form input, .util-form input { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; box-sizing: border-box; }
-        .auth-form button, .upload-form button, .friend-form button, .util-form button { width: 100%; padding: 10px; background-color: #FF0000; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: background-color 0.2s; margin-top: 5px;}
-        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .util-form button:hover { background-color: #CC0000; }
-        
-        .logout-button { background-color: #555555 !important; }
-        .logout-button:hover { background-color: #666666 !important; }
+        /* Contenu Principal */
+        .content-area { flex-grow: 1; padding: 20px; }
+        
+        /* Grille de Vidéos */
+        .video-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); 
+            gap: 20px; 
+            margin-top: 20px; 
+        }
+        .video-item { color: #FFFFFF; }
+        .thumbnail-placeholder { width: 100%; height: 180px; background-color: #303030; display: flex; align-items: center; justify-content: center; border-radius: 8px; margin-bottom: 10px; position: relative; overflow: hidden;}
+        .thumbnail-placeholder img { width: 100%; height: 100%; object-fit: cover; }
+        .video-details { display: flex; }
+        .video-info { margin-left: 10px; }
+        .video-info h4 { font-size: 16px; font-weight: 500; margin: 0 0 5px 0; line-height: 1.3; }
+        .video-info p { font-size: 12px; color: #AAAAAA; margin: 0; }
+        .channel-icon { width: 36px; height: 36px; background: #FF0000; border-radius: 50%; flex-shrink: 0; }
+        .video-status-download a { color: #00BFFF; font-weight: 500; text-decoration: none; }
+        .video-status-download a:hover { text-decoration: underline; }
 
-        /* Messages Flash */
-        .flash { padding: 15px; margin-bottom: 20px; border-radius: 4px; font-weight: bold; }
-        .success { background-color: #4CAF50; color: white; }
-        .error { background-color: #FF5555; color: white; }
-        .info { background-color: #3498db; color: white; }
-        
-        .section-title { color: #FFFFFF; font-size: 20px; font-weight: 500; margin-top: 30px; margin-bottom: 15px; }
+        /* Chat Box */
+        .chat-container { margin-top: 40px; padding-top: 20px; border-top: 1px solid #303030; }
+        .chat-box { height: 300px; border: 1px solid #404040; overflow-y: scroll; padding: 15px; margin-bottom: 15px; background-color: #202020; border-radius: 8px; }
+        .message { margin-bottom: 8px; }
+        .user-pseudo { font-weight: 500; color: #4CAF50; margin-right: 8px; } 
+        .message-input { display: flex; }
+        .message-input input { flex-grow: 1; margin-right: 10px; background: #303030; border: 1px solid #404040; color: #FFFFFF; padding: 10px; border-radius: 4px; }
+        .message-input button { background-color: #FF0000; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; transition: background-color 0.2s; }
+        .message-input button:hover { background-color: #CC0000; }
 
-        /* Liste des images GIF converties */
-        .image-grid { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 20px; }
-        .image-item { width: 150px; text-align: center; }
-        .image-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 4px; border: 1px solid #303030; }
-    </style>
+
+        /* Formulaires et Boutons d'Action (Sidebar) */
+        .auth-form input, .upload-form input, .friend-form input, .util-form input { width: 100%; padding: 10px; margin-bottom: 10px; border: 1px solid #404040; border-radius: 4px; background: #303030; color: #FFFFFF; box-sizing: border-box; }
+        .auth-form button, .upload-form button, .friend-form button, .util-form button { width: 100%; padding: 10px; background-color: #FF0000; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: 500; transition: background-color 0.2s; margin-top: 5px;}
+        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .util-form button:hover { background-color: #CC0000; }
+        
+        .logout-button { background-color: #555555 !important; }
+        .logout-button:hover { background-color: #666666 !important; }
+
+        /* Messages Flash */
+        .flash { padding: 15px; margin-bottom: 20px; border-radius: 4px; font-weight: bold; }
+        .success { background-color: #4CAF50; color: white; }
+        .error { background-color: #FF5555; color: white; }
+        .info { background-color: #3498db; color: white; }
+        
+        .section-title { color: #FFFFFF; font-size: 20px; font-weight: 500; margin-top: 30px; margin-bottom: 15px; }
+
+        /* Liste des images GIF converties */
+        .image-grid { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 20px; }
+        .image-item { width: 150px; text-align: center; }
+        .image-item img { width: 100%; height: 100px; object-fit: cover; border-radius: 4px; border: 1px solid #303030; }
+        .image-item a { color: #AAAAAA; text-decoration: none; font-size: 12px; }
+        .image-item a:hover { text-decoration: underline; }
+
+    </style>
 </head>
 <body>
-    <div class="header">
-        <div class="logo">You<span>Tube</span> (Social Python)</div>
-        {% if user_username %}
-            <div class="user-action">
-                <span style="font-size: 14px; margin-right: 15px; color: #AAAAAA;">Jeton CSRF: {{ csrf_token[:6] }}...</span>
-                <span class="material-icons" style="color: white;">account_circle</span>
-            </div>
-        {% endif %}
-    </div>
+    <div class="header">
+        <div class="logo">You<span>Tube</span> (Social Python)</div>
+        {% if user_username %}
+            <div class="user-action">
+                <span style="font-size: 14px; margin-right: 15px; color: #AAAAAA;">Jeton CSRF: {{ csrf_token[:6] }}...</span>
+                <span class="material-icons" style="color: white;">account_circle</span>
+            </div>
+        {% endif %}
+    </div>
 
-    <div class="main-layout">
-        <div class="sidebar">
-            <div class="sidebar-item" onclick="window.location.href='/'">
-                <span class="material-icons">home</span> Accueil
-            </div>
-            
-            {% if user_username %}
-                <h3>VOTRE COMPTE</h3>
-                <p style="padding: 10px 15px; font-size: 14px;">Connecté: <br><strong>@{{ user_username }}</strong></p>
-                
-                <h3>ACTIONS VIDÉO</h3>
-                
-                <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" style="padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="text" name="title" placeholder="Titre de la vidéo" required>
-                    <input type="file" name="file" required>
-                    <button type="submit">Uploader & Publier</button>
-                </form>
+    <div class="main-layout">
+        <div class="sidebar">
+            <div class="sidebar-item" onclick="window.location.href='/'">
+                <span class="material-icons">home</span> Accueil
+            </div>
+            
+            {% if user_username %}
+                <h3>VOTRE COMPTE</h3>
+                <p style="padding: 10px 15px; font-size: 14px;">Connecté: <br><strong>@{{ user_username }}</strong></p>
+                
+                <h3>ACTIONS VIDÉO</h3>
+                
+                <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="text" name="title" placeholder="Titre de la vidéo" required>
+                    <input type="file" name="file" required>
+                    <button type="submit">Uploader & Publier</button>
+                </form>
 
-                <h3>UTILITAIRE</h3>
-                <form class="util-form" method="POST" action="{{ url_for('convert_gif') }}" enctype="multipart/form-data" style="padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="file" name="gif_file" accept=".gif" required>
-                    <button type="submit" style="background-color: #9B59B6;">Convertir GIF -> PNG</button>
-                </form>
-                
-                <h3>GESTION AMIS</h3>
-                <form class="friend-form" method="POST" action="{{ url_for('add_friend') }}" style="padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="text" name="friend_username" placeholder="Pseudo de l'ami" required>
-                    <button type="submit" style="background-color: #2ECC71;">Ajouter Ami</button>
-                </form>
+                <h3>UTILITAIRE</h3>
+                <form class="util-form" method="POST" action="{{ url_for('convert_gif') }}" enctype="multipart/form-data" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="file" name="gif_file" accept=".gif" required>
+                    <button type="submit" style="background-color: #9B59B6;">Convertir GIF -> PNG</button>
+                </form>
+                
+                <h3>GESTION AMIS</h3>
+                <form class="friend-form" method="POST" action="{{ url_for('add_friend') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="text" name="friend_username" placeholder="Pseudo de l'ami" required>
+                    <button type="submit" style="background-color: #2ECC71;">Ajouter Ami</button>
+                </form>
 
-                <form method="POST" action="{{ url_for('logout') }}" style="margin-top: 20px; padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <button type="submit" class="logout-button">Déconnexion</button>
-                </form>
+                <form method="POST" action="{{ url_for('logout') }}" style="margin-top: 20px; padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <button type="submit" class="logout-button">Déconnexion</button>
+                </form>
 
-            {% else %}
-                <h3>CONNEXION / INSCRIPTION</h3>
-                <form class="auth-form" method="POST" action="{{ url_for('register') }}" style="padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="email" name="email" placeholder="Email" required>
-                    <input type="text" name="username" placeholder="Pseudo" required>
-                    <input type="password" name="password" placeholder="Mot de passe" required>
-                    <button type="submit">S'inscrire</button>
-                </form>
-                <form class="auth-form" method="POST" action="{{ url_for('login') }}" style="padding: 10px 0;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                    <input type="text" name="username" placeholder="Pseudo" required>
-                    <input type="password" name="password" placeholder="Mot de passe" required>
-                    <button type="submit">Connexion</button>
-                </form>
-            {% endif %}
-        </div>
-        
-        <div class="content-area">
-            {% with messages = get_flashed_messages(with_categories=true) %}
-                {% if messages %}
-                    {% for category, message in messages %}
-                        <div class="flash {{ category }}">{{ message }}</div>
-                    {% endfor %}
-                {% endif %}
-            {% endwith %}
+            {% else %}
+                <h3>CONNEXION / INSCRIPTION</h3>
+                <form class="auth-form" method="POST" action="{{ url_for('register') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="email" name="email" placeholder="Email" required>
+                    <input type="text" name="username" placeholder="Pseudo" required>
+                    <input type="password" name="password" placeholder="Mot de passe" required>
+                    <button type="submit">S'inscrire</button>
+                </form>
+                <form class="auth-form" method="POST" action="{{ url_for('login') }}" style="padding: 10px 0;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="text" name="username" placeholder="Pseudo" required>
+                    <input type="password" name="password" placeholder="Mot de passe" required>
+                    <button type="submit">Connexion</button>
+                </form>
+            {% endif %}
+        </div>
+        
+        <div class="content-area">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="flash {{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
 
-            {% if user_username %}
+            {% if user_username %}
 
-                <h2 class="section-title">En Tendances (Vidéos Publiées)</h2>
-                <div class="video-grid">
-                    {% for video in uploaded_videos | reverse %}
-                        <div class="video-item">
-                            <div class="thumbnail-placeholder">
-                                <img src="data:image/svg+xml;charset=UTF-8,%3Csvg%20width%3D%22300%22%20height%3D%22180%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20300%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Crect%20width%3D%22300%22%20height%3D%22180%22%20fill%3D%22%23303030%22%3E%3C%2Frect%3E%3Ctext%20x%3D%2250%25%22%20y%3D%2250%25%22%20fill%3D%22%23AAAAAA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2218%22%20text-anchor%3D%22middle%22%3E{{ video.title }}%3C%2Ftext%3E%3C%2Fsvg%3E" alt="Miniature">
-                            </div>
-                            <div class="video-details">
-                                <div class="channel-icon"></div>
-                                <div class="video-info">
-                                    <h4>{{ video.title }}</h4>
-                                    <p>@{{ video.user }}</p>
-                                    <p>{{ video.date }} | Statut: {{ video.status }}</p>
-                                    {% if video.status == 'Converti (Simulé)' %}
-                                        <div class="video-status-download">
-                                            <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download>Télécharger</a>
-                                        </div>
-                                    {% endif %}
-                                </div>
-                            </div>
-                        </div>
-                    {% endfor %}
-                    {% if not uploaded_videos %}
-                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Utilisez le menu latéral pour uploader votre propre vidéo.</p>
-                    {% endif %}
-                </div>
-                
-                <h2 class="section-title" style="margin-top: 50px;">🖼️ Conversions GIF récentes</h2>
-                <div class="image-grid">
-                    {% for img in uploaded_images | reverse %}
-                        <div class="image-item">
-                            <img src="{{ url_for('download_converted_image', filename=img.filename) }}" alt="Image convertie">
-                            <a href="{{ url_for('download_converted_image', filename=img.filename) }}" download style="font-size: 12px; color: #AAAAAA;">Télécharger {{ img.format }}</a>
-                        </div>
-                    {% endfor %}
-                </div>
-                
-                <div class="chat-container">
-                    <h2 class="section-title">💬 Messagerie Privée (Amis uniquement)</h2>
-                    <p style="font-size: small; color: #AAAAAA; margin-bottom: 10px;">Amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
-                    <div class="chat-box" id="messages">
-                        {% for msg in chat_messages %}
-                            <div class="message"><span class="user-pseudo">@{{ msg.user }}</span>: {{ msg.text }}</div>
-                        {% endfor %}
-                    </div>
-                    <div class="message-input">
-                        <input type="text" id="message_input" placeholder="Envoyer un message à vos amis...">
-                        <button onclick="sendMessage()">Envoyer</button>
-                    </div>
-                </div>
+                <h2 class="section-title">En Tendances (Vidéos Publiées)</h2>
+                <div class="video-grid">
+                    {% for video in uploaded_videos | reverse %}
+                        <div class="video-item">
+                            <div class="thumbnail-placeholder">
+                                <img src="data:image/svg+xml;charset=UTF-8,%3Csvg%20width%3D%22300%22%20height%3D%22180%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20300%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Crect%20width%3D%22300%22%20height%3D%22180%22%20fill%3D%22%23303030%22%3E%3C%2Frect%3E%3Ctext%20x%3D%2250%25%22%20y%3D%2250%25%22%20fill%3D%22%23AAAAAA%22%20font-family%3D%22sans-serif%22%20font-size%3D%2218%22%20text-anchor%3D%22middle%22%3E{{ video.title }}%3C%2Ftext%3E%3C%2Fsvg%3E" alt="Miniature">
+                            </div>
+                            <div class="video-details">
+                                <div class="channel-icon"></div>
+                                <div class="video-info">
+                                    <h4>{{ video.title }}</h4>
+                                    <p>@{{ video.user }}</p>
+                                    <p>{{ video.date }} | Statut: {{ video.status }}</p>
+                                    {% if video.status == 'Converti (Simulé)' %}
+                                        <div class="video-status-download">
+                                            <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download>Télécharger</a>
+                                        </div>
+                                    {% endif %}
+                                </div>
+                            </div>
+                        </div>
+                    {% endfor %}
+                    {% if not uploaded_videos %}
+                        <p style="font-size: small; color: #AAAAAA;">Aucune vidéo publiée. Utilisez le menu latéral pour uploader votre propre vidéo.</p>
+                    {% endif %}
+                </div>
+                
+                <h2 class="section-title" style="margin-top: 50px;">🖼️ Conversions GIF récentes</h2>
+                <div class="image-grid">
+                    {% for img in uploaded_images | reverse %}
+                        <div class="image-item">
+                            <img src="{{ url_for('download_converted_image', filename=img.filename) }}" alt="Image convertie">
+                            <a href="{{ url_for('download_converted_image', filename=img.filename) }}" download>Télécharger {{ img.format }}</a>
+                        </div>
+                    {% endfor %}
+                </div>
+                
+                <div class="chat-container">
+                    <h2 class="section-title">💬 Messagerie Privée (Amis uniquement)</h2>
+                    <p style="font-size: small; color: #AAAAAA; margin-bottom: 10px;">Amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
+                    <div class="chat-box" id="messages">
+                        {% for msg in chat_messages %}
+                            <div class="message"><span class="user-pseudo">@{{ msg.user }}</span>: {{ msg.text }}</div>
+                        {% endfor %}
+                    </div>
+                    <div class="message-input">
+                        <input type="text" id="message_input" placeholder="Envoyer un message à vos amis...">
+                        <button onclick="sendMessage()">Envoyer</button>
+                    </div>
+                </div>
 
-                <script>
-                    var socket = io();
-                    var user_username = "{{ user_username }}";
+                <script>
+                    var socket = io();
+                    var user_username = "{{ user_username }}";
 
-                    // --- Réception de messages ---
-                    socket.on('broadcast_message', function(data) {
-                        var messagesDiv = document.getElementById('messages');
-                        var div = document.createElement('div');
-                        div.className = 'message';
-                                    
-                        if (data.user === 'Système') {
-                            div.innerHTML = '<span style="font-weight: 700; color: #FF0000;">[' + data.user + ']</span>: ' + data.text;
-                        } else {
-                            div.innerHTML = '<span class="user-pseudo">@' + data.user + '</span>: ' + data.text;
-                        }
-                        
-                        messagesDiv.appendChild(div);
-                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    });
+                    // --- Réception de messages ---
+                    socket.on('broadcast_message', function(data) {
+                        var messagesDiv = document.getElementById('messages');
+                        var div = document.createElement('div');
+                        div.className = 'message';
+                                        
+                        if (data.user === 'Système') {
+                            div.innerHTML = '<span style="font-weight: 700; color: #FF0000;">[' + data.user + ']</span>: ' + data.text;
+                        } else {
+                            div.innerHTML = '<span class="user-pseudo">@' + data.user + '</span>: ' + data.text;
+                        }
+                        
+                        messagesDiv.appendChild(div);
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    });
 
-                    // --- Envoi de messages ---
-                    function sendMessage() {
-                        var input = document.getElementById('message_input');
-                        var content = input.value;
+                    // --- Envoi de messages ---
+                    function sendMessage() {
+                        var input = document.getElementById('message_input');
+                        var content = input.value;
 
-                        if (content && user_username) {
-                            socket.emit('new_message', {
-                                user: user_username,
-                                text: content
-                            });
-                            input.value = '';
-                        }
-                    }
+                        if (content && user_username) {
+                            socket.emit('new_message', {
+                                user: user_username,
+                                text: content
+                            });
+                            input.value = '';
+                        }
+                    }
 
-                    // Envoyer avec la touche Entrée
-                    document.getElementById('message_input').addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter') {
-                            sendMessage();
-                        }
-                    });
+                    // Envoyer avec la touche Entrée
+                    document.getElementById('message_input').addEventListener('keypress', function(e) {
+                        if (e.key === 'Enter') {
+                            sendMessage();
+                        }
+                    });
 
-                    // Scroll au bas au chargement
-                    document.addEventListener('DOMContentLoaded', (event) => {
-                        var messagesDiv = document.getElementById('messages');
-                        if (messagesDiv) {
-                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                        }
-                    });
-                </script>
+                    // Scroll au bas au chargement
+                    document.addEventListener('DOMContentLoaded', (event) => {
+                        var messagesDiv = document.getElementById('messages');
+                        if (messagesDiv) {
+                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        }
+                    });
+                </script>
 
-            {% else %}
-                <h1 style="text-align: center; color: #FFFFFF; margin-top: 50px;">Bienvenue sur YouTube Social Python!</h1>
-                <p style="text-align: center; color: #AAAAAA; margin-top: 20px;">Utilisez le panneau de gauche pour vous inscrire ou vous connecter.</p>
-            {% endif %}
-        </div>
-    </div>
+            {% else %}
+                <h1 style="text-align: center; color: #FFFFFF; margin-top: 50px;">Bienvenue sur YouTube Social Python!</h1>
+                <p style="text-align: center; color: #AAAAAA; margin-top: 20px;">Utilisez le panneau de gauche pour vous inscrire ou vous connecter.</p>
+            {% endif %}
+        </div>
+    </div>
 </body>
 </html>
 """
@@ -392,14 +402,14 @@ def generate_unique_filename(extension):
 
 def convert_to_mp4(input_path, output_dir):
     """Fonction de conversion DE-ACTIVÉE / SIMULÉE."""
-    # Cette simulation fonctionne pour les environnements légers, car elle n'appelle pas FFmpeg
-    # et crée juste un fichier "placeholder"
-    print("ATTENTION: La conversion FFmpeg est désactivée (pour l'hébergement gratuit). Retourne un fichier de test.")
+    # SIMULATION: Crée un fichier placeholder pour démontrer le workflow sans utiliser FFmpeg.
+    print("ATTENTION: La conversion FFmpeg est désactivée. Retourne un fichier de test.")
     
     simulated_filename = "simulated_video_" + generate_unique_filename("mp4")
     try:
+        # Crée un petit fichier vide/placeholder dans le répertoire "converted"
         with open(os.path.join(output_dir, simulated_filename), 'w') as f:
-            f.write("Ceci est un fichier vidéo simulé.")
+            f.write(f"Ceci est un fichier vidéo simulé converti à partir de {os.path.basename(input_path)}.")
     except Exception as e:
         print(f"Erreur lors de la création du fichier simulé: {e}")
         return None
@@ -412,7 +422,6 @@ def convert_to_mp4(input_path, output_dir):
 
 def check_csrf_token(request):
     """Vérifie si le jeton CSRF est valide (sécurité anti-bot)."""
-    # Le jeton doit être présent dans le formulaire et correspondre à celui de la session
     return request.form.get('csrf_token') == session.get('csrf_token')
 
 
@@ -424,7 +433,6 @@ def check_csrf_token(request):
 def index():
     # 🍪 1. Gestion du Jeton CSRF
     if 'csrf_token' not in session:
-        # Création d'un jeton aléatoire sécurisé et stockage en session
         session['csrf_token'] = secrets.token_hex(16)
         
     current_username = session.get('user_username')
@@ -444,7 +452,7 @@ def index():
         uploaded_videos=uploaded_videos,
         uploaded_images=uploaded_images,
         friend_names=friend_names,
-        csrf_token=session['csrf_token'] # Passe le jeton à l'HTML pour les formulaires
+        csrf_token=session['csrf_token'] 
     )
 
 @app.route('/register', methods=['POST'])
@@ -532,6 +540,7 @@ def upload_file():
         return redirect(url_for('index'))
 
     if file:
+        # Sécurisation du nom de fichier pour éviter les attaques de chemin
         filename = secure_filename(file.filename)
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
@@ -594,7 +603,7 @@ def convert_gif():
         output_path = os.path.join(app.config['CONVERTED_FOLDER'], output_filename)
         
         img = Image.open(gif_path)
-        img.seek(0) # Prendre la première image du GIF
+        img.seek(0) # Prend la première image du GIF (car un GIF est une séquence d'images)
         img.save(output_path, 'PNG')
         
         # Suppression du GIF original temporaire
@@ -615,14 +624,12 @@ def convert_gif():
 
 @app.route('/download/<filename>')
 def download_file(filename):
-    """Permet de télécharger les fichiers convertis (vidéos)."""
-    # Ce répertoire contiendra les fichiers mp4 (simulés)
+    """Permet de télécharger les fichiers convertis (vidéos simulées)."""
     return send_from_directory(app.config['CONVERTED_FOLDER'], filename, as_attachment=True)
 
 @app.route('/converted_images/<filename>')
 def download_converted_image(filename):
     """Affiche les images converties (GIF)."""
-    # Ce répertoire contiendra les fichiers png issus de la conversion
     return send_from_directory(app.config['CONVERTED_FOLDER'], filename)
 
 
@@ -728,7 +735,11 @@ def handle_new_message(data):
 # 7. LANCEMENT 
 # --------------------------
 
+# IMPORTANT : Pour Render, nous utilisons Gunicorn pour servir l'application. 
+# La commande de démarrage sur Render sera généralement: `gunicorn app:app` (ou `gunicorn app:socketio.server` si vous utilisez Flask-SocketIO)
+# Le worker doit être compatible (ex: gevent ou eventlet) si vous utilisez SocketIO en production.
+
 if __name__ == '__main__':
     PORT_CHOISI = 5003 
-    # Pour le déploiement sur Render, assurez-vous que debug=False et que la clé secrète est dans l'environnement.
+    # Le mode debug=True n'est pas utilisé en production sur Render
     socketio.run(app, debug=True, port=PORT_CHOISI)
