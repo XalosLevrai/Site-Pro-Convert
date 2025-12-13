@@ -23,12 +23,14 @@ app.config['SECRET_KEY'] = os.environ.get(
 )
 
 # Configuration de la base de données : UTILISATION DE POSTGRESQL (DATABASE_URL)
-database_url = os.environ.get('DATABASE_URL')
+# TEMPORAIRE : Utilisation de l'URL "Hard-Codée" pour contourner le problème d'environnement de Render.
+# REMPLACER VOTRE_URL_POSTGRES_COPIEE_ICI par l'URL EXTERNE réelle.
+database_url = os.environ.get('DATABASE_URL', 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a/pro_convert_db')
 
 # --- CORRECTION CRUCIALE POUR RENDER / SQLAlchemy ---
 # Si l'URL de connexion est fournie par Render au format 'postgres://', 
 # SQLAlchemy (avec psycopg2) a besoin de 'postgresql://'.
-if database_url and database_url.startswith('postgres://'):
+if database_url.startswith('postgres://'): # Ne vérifie plus si database_url existe car la valeur par défaut est toujours présente
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
