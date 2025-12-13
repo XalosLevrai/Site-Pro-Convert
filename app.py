@@ -1,519 +1,542 @@
-import os
-import io
-from flask import Flask, request, send_file, redirect, url_for, render_template_string, flash, after_this_request
+from flask import Flask, render_template_string, request, redirect, url_for, flash, session, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
-from werkzeug.security import generate_password_hash, check_password_hash
+from flask_socketio import SocketIO, emit
 from werkzeug.utils import secure_filename
-from PIL import Image
-import ffmpeg # Nécessite la librairie ffmpeg sur l'environnement d'hébergement (Render/Dockerfile)
-import zipfile
+from werkzeug.security import generate_password_hash, check_password_hash
+import os
+import datetime
+import random
+import string
 import yt_dlp
+# import ffmpeg  # <-- DÉSACTIVÉ TEMPORAIREMENT
 
 # --------------------------
-# 1. CONFIGURATION
+# 1. INITIALISATION ET CONFIG
 # --------------------------
-
-UPLOAD_FOLDER = 'uploads'
-CONVERTED_FOLDER = 'converted'
 
 app = Flask(__name__)
 
 # LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT
-app.secret_key = os.environ.get('SECRET_KEY', 'CLE_SECRETE_TRES_LONGUE_ET_UNIQUE_DE_SECOURS')
+app.config['SECRET_KEY'] = os.environ.get(
+    'SECRET_KEY', 
+    'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod'
+)
 
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['CONVERTED_FOLDER'] = CONVERTED_FOLDER
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# VOTRE URL POSTGRES COPIÉE DE RENDER
+RAW_DATABASE_URL = 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db' 
 
-# CORRECTION CRITIQUE POUR RENDER : Utilisation de PostgreSQL via l'environnement
-RAW_DATABASE_URL = os.environ.get(
-    'DATABASE_URL', 
-    'postgresql://user:password@host:port/dbname' # Placeholder
-) 
-# Fix common error: replace 'postgres://' with 'postgresql://'
+# Correction du format de l'URL
 if RAW_DATABASE_URL.startswith('postgres://'):
     database_url = RAW_DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 else:
     database_url = RAW_DATABASE_URL
+
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False 
+
+# Dossiers d'uploads
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # Limite d'upload à 100MB
 
 db = SQLAlchemy(app)
+socketio = SocketIO(app)
 
-login_manager = LoginManager()
-login_manager.init_app(app)
-login_manager.login_view = 'login'
+# Créer les dossiers nécessaires s'ils n'existent pas
+for folder in [app.config['UPLOAD_FOLDER'], 'converted']:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
 
-# Création des dossiers au démarrage
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(CONVERTED_FOLDER, exist_ok=True)
+# Listes temporaires pour le contenu non stocké en DB (non persistants après redémarrage)
+chat_messages = []
+uploaded_videos = []
 
 # --------------------------
-# 2. MODÈLE DE BASE DE DONNÉES
+# 2. MODÈLES DE BASE DE DONNÉES (PSEUDO, EMAIL ET AMIS)
 # --------------------------
 
-class User(db.Model, UserMixin):
+# Table d'association pour la relation plusieurs-à-plusieurs (Amis)
+friends = db.Table('friends',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
+    db.Column('friend_id', db.Integer, db.ForeignKey('user.id'), primary_key=True)
+)
+
+class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(100), unique=True, nullable=False)
-    # Taille augmentée pour le hash de mot de passe (si Flask-Login utilise un algo long)
-    password_hash = db.Column(db.String(256), nullable=False) 
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    # Taille augmentée pour le hash de mot de passe
+    password = db.Column(db.String(256), nullable=False) 
 
+    # Relation d'Amis
+    friends = db.relationship(
+        'User', 
+        secondary=friends,
+        primaryjoin=(friends.c.user_id == id),
+        secondaryjoin=(friends.c.friend_id == id),
+        backref=db.backref('friend_of', lazy='dynamic'),
+        lazy='dynamic'
+    )
+    
     def set_password(self, password):
-        # Utilisation de sha256 par défaut pour werkzeug
-        self.password_hash = generate_password_hash(password)
+        self.password = generate_password_hash(password, method='pbkdf2:sha256')
 
     def check_password(self, password):
-        return check_password_hash(self.password_hash, password)
+        return check_password_hash(self.password, password)
 
-@login_manager.user_loader
-def load_user(user_id):
-    return User.query.get(int(user_id))
+    def add_friend(self, user):
+        if not self.is_friend(user):
+            self.friends.append(user)
+            user.friends.append(self) 
+
+    def is_friend(self, user):
+        with app.app_context():
+            return db.session.query(friends).filter(
+                friends.c.user_id == self.id, 
+                friends.c.friend_id == user.id
+            ).count() > 0
+
+    def __repr__(self):
+        return f"User('{self.username}')"
 
 # --------------------------
-# 3. INITIALISATION DB POUR RENDER
+# CORRECTION DÉPLOIEMENT : CRÉATION DE TABLES FORCÉE
 # --------------------------
-# Ce bloc est crucial pour créer les tables PostgreSQL au démarrage
+# Ce bloc est CRUCIAL. Il assure que les tables DB sont créées 
+# dès que le module 'app' est chargé, contournant les problèmes de Gunicorn/Render.
 with app.app_context():
-    print("Tentative de CRÉATION des tables PostgreSQL...")
+    print("Tentative de CRÉATION des tables via app_context (fix UndefinedTable)...")
     try:
+        # Ceci crée les tables s'ils n'existent pas
         db.create_all() 
         print("Tables de la base de données créées/vérifiées avec succès.")
     except Exception as e:
         print(f"Échec de la création des tables lors du démarrage: {e}")
+        # On log l'erreur mais on ne bloque pas le démarrage de l'application
+# --------------------------
 
 
 # --------------------------
-# 4. FONCTIONS UTILITAIRES
-# --------------------------
-
-def allowed_file(filename, extensions):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in extensions
-
-# --------------------------
-# 5. TEMPLATE HTML (Non modifié)
+# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Interface utilisateur)
 # --------------------------
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="fr">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Convertisseur Vidéo Pro | Xalos Edition</title>
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; background: linear-gradient(135deg, #e0f2f1 0%, #b2dfdb 100%); color: #333; min-height: 100vh; display: flex; flex-direction: column; }
-        .container { max-width: 800px; width: 90%; margin: 50px auto; background: #ffffff; padding: 30px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.15); flex-grow: 1; }
-        h1 { color: #00796b; text-align: center; margin-bottom: 25px; border-bottom: 3px solid #00796b; padding-bottom: 10px; }
-        h2 { color: #009688; border-bottom: 1px solid #e0e0e0; padding-bottom: 5px; margin-top: 25px; }
+    <title>Mon Réseau Social Python</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        /* CSS V3: Plus Stylé et Moderne */
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
+        body { font-family: 'Roboto', sans-serif; margin: 0; padding: 0; background-color: #f0f2f5; color: #1c1e21; }
+        .container { display: flex; max-width: 1400px; margin: 40px auto; background: #ffffff; border-radius: 18px; box-shadow: 0 12px 24px rgba(0, 0, 0, 0.1); min-height: 85vh; overflow: hidden; }
+        .sidebar { width: 320px; background-color: #294a73; color: white; padding: 30px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between; }
+        .main-content { flex-grow: 1; padding: 30px; }
+        h1, h2, h3 { color: #294a73; margin-bottom: 15px; }
+        h2 { border-bottom: 2px solid #5a82a0; padding-bottom: 10px; }
+        
+        /* Formulaires */
+        .auth-form input, .upload-form input, .friend-form input { width: 100%; padding: 14px; margin-bottom: 15px; border: none; border-radius: 8px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.1); background: #f7f7f7; font-size: 16px; }
+        .auth-form button, .upload-form button, .friend-form button, .reset-button { width: 100%; padding: 14px; background-color: #4CAF50; color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: 700; transition: background-color 0.3s; margin-top: 5px;}
+        .auth-form button:hover, .upload-form button:hover, .friend-form button:hover, .reset-button:hover { background-color: #45a049; }
+        
+        /* Connexion/Déconnexion */
+        .sidebar p strong { color: #ffeb3b; font-size: 1.1em; }
+        .sidebar .logout-button { background-color: #e74c3c; margin-top: 20px; }
+        .sidebar .logout-button:hover { background-color: #c0392b; }
 
-        .auth-forms { display: flex; justify-content: space-around; gap: 20px; margin-bottom: 30px; }
-        .auth-section { flex: 1; border: 1px solid #ccc; padding: 20px; border-radius: 8px; background-color: #f9f9f9; }
-        input[type="email"], input[type="password"], input[type="text"] { padding: 10px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; margin-bottom: 10px; }
-        .converter-section { border: 2px solid #b2dfdb; padding: 20px; margin-bottom: 25px; border-radius: 8px; background-color: #f0fdfc; }
+        /* Messages Flash */
+        .flash { padding: 15px; margin-bottom: 20px; border-radius: 8px; font-weight: bold; }
+        .success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .info { background-color: #cce5ff; color: #004085; border: 1px solid #b8daff; }
 
-        button { background-color: #009688; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; font-size: 16px; width: 100%; margin-top: 10px; }
-        button:hover { background-color: #00796b; }
-        select { padding: 10px; border: 1px solid #ccc; border-radius: 4px; width: 100%; box-sizing: border-box; margin-bottom: 10px; }
-        
-        .message { margin-bottom: 15px; padding: 10px; border-radius: 4px; font-weight: bold; }
-        .success { background-color: #e0f2f1; color: #004d40; border: 1px solid #b2dfdb; }
-        .error { background-color: #ffcdd2; color: #b71c1c; border: 1px solid #ef9a9a; }
-        
-        .footer { margin-top: auto; padding: 15px 0; text-align: right; color: #555; font-size: 0.9em; background-color: #e0e0e0; border-top: 1px solid #ccc; }
-        .creator-tag { padding-right: 30px; }
-    </style>
+        /* Chat */
+        .chat-box { height: 400px; border: 1px solid #ddd; overflow-y: scroll; padding: 15px; margin-bottom: 15px; background-color: #fcfcfc; border-radius: 8px; }
+        .message-input { display: flex; }
+        .message-input input { flex-grow: 1; margin-right: 10px; }
+        .user-pseudo { font-weight: 700; color: #3498db; margin-right: 8px; }
+
+        /* Vidéos */
+        .video-grid { display: flex; flex-wrap: wrap; gap: 25px; margin-top: 25px; }
+        .video-item { width: calc(33.333% - 17px); background: #f9f9f9; border-radius: 10px; overflow: hidden; box-shadow: 0 4px 8px rgba(0,0,0,0.05); }
+        .video-item img { width: 100%; height: 180px; object-fit: cover; background-color: #34495e; display: block; border-bottom: 2px solid #5a82a0; }
+        .video-details { padding: 15px; }
+    </style>
 </head>
 <body>
+    <div class="container">
+        <div class="sidebar">
+            <div>
+                <h2 style="color: #ffeb3b; border-bottom-color: #5a82a0;">Hub Social Python</h2>
+                {% if user_username %}
+                    <p style="margin-top: 10px;">Connecté en tant que: <br><strong style="color: #ffeb3b;">@{{ user_username }}</strong></p>
+                    
+                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Ajouter un Ami</h3>
+                    <form class="friend-form" method="POST" action="{{ url_for('add_friend') }}">
+                        <input type="text" name="friend_username" placeholder="Pseudo de l'ami" required>
+                        <button type="submit">Ajouter l'Ami</button>
+                    </form>
 
-<div class="container">
-    <h1>Outil de Conversion Vidéo Professionnel</h1>
-    
-    {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-            {% for category, message in messages %}
-            <div class="message {{ category }}">{{ message }}</div>
-            {% endfor %}
-        {% endif %}
-    {% endwith %}
+                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Publier (Vidéo)</h3>
+                    <form class="upload-form" method="POST" action="{{ url_for('upload_file') }}" enctype="multipart/form-data">
+                        <input type="text" name="title" placeholder="Titre de la vidéo" required>
+                        <input type="file" name="file" required>
+                        <button type="submit">Uploader Vidéo</button>
+                    </form>
+                    
+                    <h3 style="color: white; border-bottom: 1px solid #5a82a0; padding-bottom: 8px; margin-top: 25px;">Mot de Passe</h3>
+                    <p style="font-size: small; color: #bdc3c7;">
+                        <button class="reset-button" style="background-color: #f39c12;" onclick="document.getElementById('reset-form').style.display='block'">Réinitialiser</button>
+                    </p>
+                    <form id="reset-form" method="POST" action="{{ url_for('forgot_password') }}" style="display:none; margin-top: 10px;">
+                        <input type="email" name="email" placeholder="Votre Email" required>
+                        <button type="submit">Envoyer Lien</button>
+                    </form>
 
-    {% if not current_user.is_authenticated %}
-        <h2>Connexion / Créer un Compte</h2>
-        <div class="auth-forms">
-            <div class="auth-section">
-                <h3>Se connecter</h3>
-                <form method="post" action="{{ url_for('login') }}">
-                    <input type="email" name="email" placeholder="Email" required>
-                    <input type="password" name="password" placeholder="Mot de passe" required>
-                    <button type="submit">Connexion Email</button>
-                </form>
-            </div>
-            
-            <div class="auth-section">
-                <h3>Créer un Compte</h3>
-                <form method="post" action="{{ url_for('register') }}">
-                    <input type="email" name="email" placeholder="Email" required>
-                    <input type="password" name="password" placeholder="Mot de passe" required>
-                    <button type="submit">Créer le Compte</button>
-                </form>
-            </div>
-        </div>
-    {% else %}
-        <p style="text-align: right;">Connecté en tant que: <b>{{ current_user.email }}</b> | <a href="{{ url_for('logout') }}">Déconnexion</a></p>
-        
-        <h2>Téléchargement & Conversion Vidéo</h2>
+                {% else %}
+                    <h3 style="color: white;">Créer un compte</h3>
+                    <form class="auth-form" method="POST" action="{{ url_for('register') }}">
+                        <input type="email" name="email" placeholder="Email (Unique)" required>
+                        <input type="text" name="username" placeholder="Pseudo (Unique)" required>
+                        <input type="password" name="password" placeholder="Mot de passe" required>
+                        <button type="submit">S'inscrire</button>
+                    </form>
+                    <h3 style="color: white; margin-top: 25px;">Se connecter</h3>
+                    <form class="auth-form" method="POST" action="{{ url_for('login') }}">
+                        <input type="text" name="username" placeholder="Pseudo" required>
+                        <input type="password" name="password" placeholder="Mot de passe" required>
+                        <button type="submit">Connexion</button>
+                    </form>
+                {% endif %}
+            </div>
 
-        <div class="converter-section">
-            <h2>🔗 URL (YouTube/TikTok) en MP4/MP3</h2>
-            <form method="post" action="{{ url_for('download_url') }}">
-                <label for="video_url">Collez l'URL YouTube ou TikTok :</label>
-                <input type="text" id="video_url" name="url" placeholder="Ex: https://www.youtube.com/watch?v=..." required>
-                
-                <label for="format_select">Choisir le format de sortie :</label>
-                <select name="format" id="format_select" required>
-                    <option value="mp4">Vidéo (MP4)</option>
-                    <option value="mp3">Audio (MP3)</option>
-                </select>
+            {% if user_username %}
+            <form method="POST" action="{{ url_for('logout') }}" style="margin-top: 20px;">
+                <button type="submit" class="logout-button">Déconnexion</button>
+            </form>
+            {% endif %}
+        </div>
+        
+        <div class="main-content">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+                {% if messages %}
+                    {% for category, message in messages %}
+                        <div class="flash {{ category }}">{{ message }}</div>
+                    {% endfor %}
+                {% endif %}
+            {% endwith %}
 
-                <button type="submit">Télécharger & Convertir</button>
-            </form>
-        </div>
+            {% if user_username %}
+                <h2>👥 Amis Connectés</h2>
+                <p>Liste des amis : {% for friend_name in friend_names %}@{{ friend_name }}{% if not loop.last %}, {% endif %}{% endfor %}</p>
+                {% if not friend_names %}<p style="font-size: small; color: #7f8c8d;">Ajoutez des amis via la barre latérale.</p>{% endif %}
 
-        <div class="converter-section">
-            <h2>🖼️ Fichier GIF en Trames PNG (Fichier ZIP)</h2>
-            <form method="post" action="{{ url_for('convert_gif') }}" enctype="multipart/form-data">
-                <label for="gifFile">Sélectionner un fichier GIF :</label>
-                <input type="file" id="gifFile" name="file" accept=".gif" required>
-                <button type="submit">Convertir en Trames ZIP</button>
-            </form>
-        </div>
+                <h2 style="margin-top: 40px;">💬 Messagerie Temps Réel</h2>
+                <div class="chat-box" id="messages">
+                    {% for msg in chat_messages %}
+                        <div class="message"><span class="user-pseudo">@{{ msg.user }}</span>: {{ msg.text }}</div>
+                    {% endfor %}
+                </div>
+                <div class="message-input">
+                    <input type="text" id="message_input" placeholder="Envoyer un message texte (pas vocal/appel)">
+                    <button onclick="sendMessage()">Envoyer</button>
+                </div>
+                
+                <h2 style="margin-top: 40px;">📼 Fil d'Actualité Vidéo (Fonctionnalité désactivée)</h2>
+                <div class="video-grid">
+                    {% for video in uploaded_videos %}
+                        <div class="video-item">
+                            <img src="data:image/svg+xml;charset=UTF-8,%3Csvg%20width%3D%22300%22%20height%3D%22180%22%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%20300%20180%22%20preserveAspectRatio%3D%22none%22%3E%3Crect%20width%3D%22300%22%20height%3D%22180%22%20fill%3D%22%23294a73%22%3E%3C%2Frect%3E%3Ctext%20x%3D%2250%25%22%20y%3D%2250%25%22%20fill%3D%22%23f0f2f5%22%20font-family%3D%22sans-serif%22%20font-size%3D%2220%22%20text-anchor%3D%22middle%22%3E{{ video.title }}%3C%2Ftext%3E%3C%2Fsvg%3E" alt="Miniature">
+                            <div class="video-details">
+                                <h4>{{ video.title }}</h4>
+                                <p style="font-size: small; color: #7f8c8d;">@{{ video.user }} | {{ video.date }}</p>
+                                <p style="font-size: small; color: #7f8c8d;">Statut : {{ video.status }}</p>
+                                {% if video.status == 'Converti (Simulé)' %}
+                                    <a href="{{ url_for('download_file', filename=video.converted_filename) }}" download style="color: #4CAF50;">Télécharger (Simulé)</a>
+                                {% endif %}
+                            </div>
+                        </div>
+                    {% endfor %}
+                    {% if not uploaded_videos %}
+                        <p style="font-size: small; color: #7f8c8d;">La fonctionnalité de conversion vidéo est désactivée pour le déploiement. Tentez l'inscription !</p>
+                    {% endif %}
+                </div>
 
-        <div class="converter-section">
-            <h2>🎧 Fichier MP4 en MP3 (Audio)</h2>
-            <form method="post" action="{{ url_for('convert_mp4') }}" enctype="multipart/form-data">
-                <label for="mp4File">Sélectionner un fichier MP4 :</label>
-                <input type="file" id="mp4File" name="file" accept=".mp4" required>
-                <button type="submit">Convertir en MP3</button>
-            </form>
-        </div>
-        
-    {% endif %}
-</div>
+                <script>
+                    var socket = io();
+                    var user_username = "{{ user_username }}";
 
-<footer class="footer">
-    <p class="creator-tag">Créateur : Xalos</p>
-</footer>
+                    // --- Réception de messages ---
+                    socket.on('broadcast_message', function(data) {
+                        var messagesDiv = document.getElementById('messages');
+                        var div = document.createElement('div');
+                        div.className = 'message';
+                        div.innerHTML = '<span class="user-pseudo">@' + data.user + '</span>: ' + data.text;
+                        messagesDiv.appendChild(div);
+                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    });
 
+                    // --- Envoi de messages ---
+                    function sendMessage() {
+                        var input = document.getElementById('message_input');
+                        var content = input.value;
+
+                        if (content && user_username) {
+                            socket.emit('new_message', {
+                                user: user_username,
+                                text: content
+                            });
+                            input.value = '';
+                        }
+                    }
+
+                    // Envoyer avec la touche Entrée
+                    document.getElementById('message_input').addEventListener('keypress', function(e) {
+                        if (e.key === 'Enter') {
+                            sendMessage();
+                        }
+                    });
+
+                    // Scroll au bas au chargement
+                    document.addEventListener('DOMContentLoaded', (event) => {
+                        var messagesDiv = document.getElementById('messages');
+                        if (messagesDiv) {
+                            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                        }
+                    });
+                </script>
+
+            {% else %}
+                <h2 style="text-align: center; color: #294a73;">Bienvenue sur votre Réseau Social Python!</h2>
+                <p style="text-align: center; color: #7f8c8d; margin-top: 20px;">Veuillez vous inscrire avec votre email et un pseudo unique pour commencer à interagir.</p>
+            {% endif %}
+        </div>
+    </div>
 </body>
 </html>
 """
 
 # --------------------------
-# 6. ROUTES FLASK
+# 4. FONCTIONS DE CONVERSION (SIMPLIFIÉES/DÉSACTIVÉES)
 # --------------------------
+
+def generate_unique_filename(extension):
+    """Génère un nom de fichier unique."""
+    return f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}_{random.randint(1000, 9999)}.{extension}"
+
+def convert_to_mp4(input_path, output_dir):
+    """Fonction de conversion DE-ACTIVÉE pour le déploiement sur Render."""
+    print("ATTENTION: FFmpeg est désactivé. Retourne un fichier de test.")
+    # Simuler la création d'un fichier de sortie
+    simulated_filename = "simulated_video_" + generate_unique_filename("mp4")
+    # Créer un fichier bidon pour simuler la conversion
+    try:
+        with open(os.path.join(output_dir, simulated_filename), 'w') as f:
+            f.write("Ceci est un fichier vidéo simulé.")
+    except Exception as e:
+        print(f"Erreur lors de la création du fichier simulé: {e}")
+        return None
+        
+    return simulated_filename
+
+# --------------------------
+# 5. ROUTES FLASK (LOGIQUE MISE À JOUR)
+# --------------------------
+
+@app.route('/', methods=['GET'])
+def index():
+    current_username = session.get('user_username')
+    friend_names = []
+    
+    if current_username:
+        with app.app_context():
+            current_user = User.query.filter_by(username=current_username).first()
+            if current_user:
+                friend_names = [f.username for f in current_user.friends.all()]
+
+    return render_template_string(
+        HTML_TEMPLATE,
+        user_username=current_username,
+        chat_messages=chat_messages,
+        uploaded_videos=uploaded_videos,
+        friend_names=friend_names
+    )
 
 @app.route('/register', methods=['POST'])
 def register():
-    email = request.form.get('email')
-    password = request.form.get('password')
-    
+    email = request.form['email']
+    username = request.form['username']
+    password = request.form['password']
+
     with app.app_context():
-        user = User.query.filter_by(email=email).first()
-        
-        if user:
-            flash('Cet email est déjà utilisé.', 'error')
+        # L'erreur UndefinedTable se produit ici si la table n'est pas créée
+        if User.query.filter_by(email=email).first():
+            flash('Cet email est déjà enregistré.', 'error')
             return redirect(url_for('index'))
-            
-        if not email or not password:
-            flash('Email et mot de passe sont requis.', 'error')
+        
+        if User.query.filter_by(username=username).first():
+            flash('Ce pseudo est déjà utilisé.', 'error')
             return redirect(url_for('index'))
 
-        new_user = User(email=email)
+        new_user = User(email=email, username=username)
         new_user.set_password(password)
+        
         db.session.add(new_user)
         db.session.commit()
         
-        flash('Compte créé avec succès ! Veuillez vous connecter.', 'success')
+        session['user_username'] = username
+        session['user_email'] = email
+        flash(f'Compte créé et connexion réussie pour @{username}!', 'success')
         return redirect(url_for('index'))
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.route('/login', methods=['POST'])
 def login():
-    if request.method == 'POST':
-        email = request.form.get('email')
-        password = request.form.get('password')
-        
-        with app.app_context():
-            user = User.query.filter_by(email=email).first()
-            
-            if not user or not user.check_password(password):
-                flash('Email ou mot de passe incorrect.', 'error')
-                # Redirige vers la page d'accueil pour réafficher le formulaire
-                return redirect(url_for('index'))
-            
-            login_user(user)
-            flash('Connexion réussie.', 'success')
-            return redirect(url_for('index'))
-    
-    # Pour les requêtes GET ou non POST
-    return redirect(url_for('index'))
+    username = request.form['username']
+    password = request.form['password']
 
-@app.route('/logout')
-@login_required
+    with app.app_context():
+        user = User.query.filter_by(username=username).first()
+
+        if user and user.check_password(password):
+            session['user_username'] = username
+            session['user_email'] = user.email
+            flash(f'Connexion réussie pour @{username}!', 'success')
+        else:
+            flash('Pseudo ou mot de passe incorrect.', 'error')
+            
+        return redirect(url_for('index'))
+
+@app.route('/logout', methods=['POST'])
 def logout():
-    logout_user()
-    flash('Vous avez été déconnecté.', 'success')
+    session.pop('user_username', None)
+    session.pop('user_email', None)
+    flash('Vous êtes déconnecté.', 'success')
     return redirect(url_for('index'))
 
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/download/url', methods=['POST'])
-@login_required
-def download_url():
-    url = request.form.get('url')
-    output_format = request.form.get('format')
-    
-    if not url or not output_format:
-        flash('Veuillez fournir une URL et un format de sortie.', 'error')
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'user_username' not in session:
+        flash('Veuillez vous connecter pour publier du contenu.', 'error')
         return redirect(url_for('index'))
-    
-    # Fichiers temporaires pour yt-dlp/ffmpeg
-    temp_title = f"{current_user.id}_dl_temp" 
-    temp_download_path_template = os.path.join(app.config['CONVERTED_FOLDER'], f'{temp_title}.%(ext)s')
-    downloaded_file = os.path.join(app.config['CONVERTED_FOLDER'], f'{temp_title}.mp4')
-    output_path_mp3 = os.path.join(app.config['CONVERTED_FOLDER'], f'{temp_title}.mp3')
 
-    
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best',
-        # yt-dlp essaie de nommer le fichier de sortie selon ce template.
-        'outtmpl': temp_download_path_template, 
-        'merge_output_format': 'mp4',
-        'noplaylist': True,
-        'quiet': True,
-        'no_warnings': True,
-        'socket_timeout': 30, 
-    }
+    if 'file' not in request.files:
+        flash('Aucun fichier sélectionné.', 'error')
+        return redirect(url_for('index'))
 
-    original_title = 'video_download'
-    
-    # ----------------------------------------------------
-    # FONCTION DE NETTOYAGE QUI S'EXÉCUTERA APRÈS LA RÉPONSE
-    # ----------------------------------------------------
-    @after_this_request
-    def cleanup_files(response):
-        # Cette fonction s'exécute même si l'opération échoue avant send_file
-        files_to_remove = [downloaded_file, output_path_mp3]
+    file = request.files['file']
+    title = request.form.get('title', 'Vidéo sans titre')
+
+    if file.filename == '':
+        flash('Nom de fichier invalide.', 'error')
+        return redirect(url_for('index'))
+
+    if file:
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         
         try:
-            for f in files_to_remove:
-                if os.path.exists(f):
-                    os.remove(f)
-        except Exception as e:
-            app.logger.error(f"Erreur de nettoyage de fichier pour {current_user.id}: {e}") 
-        return response
-    # ----------------------------------------------------
-
-    try:
-        # Nettoyage des résidus précédents au cas où
-        if os.path.exists(downloaded_file):
-            os.remove(downloaded_file)
+            file.save(file_path)
             
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Obtention du titre
-            info_dict = ydl.extract_info(url, download=False)
-            original_title = info_dict.get('title', 'video_download')
-            # Nettoyage des caractères illégaux/sauts de ligne
-            original_title = original_title.replace(' ', '_').replace('/', '_').replace('\\', '_').replace('\n', '').replace('\r', '')
+            # --- CONVERSION (SIMULÉE) ---
+            flash(f'Fichier "{title}" téléchargé. Conversion SIMULÉE...', 'info')
+            converted_filename = convert_to_mp4(file_path, 'converted')
             
-            # 2. Téléchargement et fusion
-            ydl.download([url])
-
-            if not os.path.exists(downloaded_file):
-                flash('Erreur: Fichier téléchargé introuvable après l\'opération. Vérifiez l\'URL.', 'error')
-                return redirect(url_for('index'))
-
-            if output_format == 'mp3':
-                output_filename = original_title + '.mp3'
-                final_path = output_path_mp3
-                
-                try:
-                    (
-                        ffmpeg
-                        .input(downloaded_file)
-                        .output(final_path, format='mp3', acodec='libmp3lame')
-                        .run(overwrite_output=True, quiet=True)
-                    )
-                except ffmpeg.Error as e:
-                    flash(f"Erreur de conversion MP3: L'outil FFmpeg est peut-être mal configuré. Détails: {e.stderr.decode('utf8')[:200]}...", 'error')
-                    return redirect(url_for('index'))
-                
-            elif output_format == 'mp4':
-                output_filename = original_title + '.mp4'
-                final_path = downloaded_file
-                
+            if converted_filename:
+                # Enregistrement dans la liste pour l'affichage
+                uploaded_videos.append({
+                    'title': title,
+                    'converted_filename': converted_filename,
+                    'date': datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    'user': session['user_username'],
+                    'status': 'Converti (Simulé)'
+                })
+                flash(f'"{title}" a été simulé et publié !', 'success')
             else:
-                flash('Format de sortie non pris en charge.', 'error')
-                return redirect(url_for('index'))
+                flash(f'Échec de la simulation de conversion.', 'error')
 
-            # Renvoyer le fichier
-            response = send_file(final_path, as_attachment=True, download_name=output_filename)
-            
-            # La fonction cleanup_files s'exécutera APRÈS l'envoi du fichier
-            return response
-            
-    except yt_dlp.utils.DownloadError as e:
-        flash(f"Erreur de téléchargement: L'URL est invalide ou la vidéo est restreinte. Détails: {e}", 'error')
-        return redirect(url_for('index'))
-    except Exception as e:
-        flash(f"Une erreur inattendue est survenue: {e}", 'error')
-        return redirect(url_for('index'))
-
-@app.route('/convert/gif', methods=['POST'])
-@login_required
-def convert_gif():
-    if 'file' not in request.files:
-        flash('Aucun fichier n\'a été envoyé', 'error')
-        return redirect(url_for('index'))
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        flash('Aucun fichier sélectionné', 'error')
-        return redirect(url_for('index'))
-        
-    if file and allowed_file(file.filename, {'gif'}):
-        filename = secure_filename(file.filename)
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(upload_path)
-        
-        base_name = filename.rsplit('.', 1)[0]
-        # Utilisation du user_id pour éviter les collisions
-        temp_dir = os.path.join(app.config['CONVERTED_FOLDER'], f"{current_user.id}_{base_name}_frames_temp")
-        os.makedirs(temp_dir, exist_ok=True) 
-
-        zip_filename = base_name + '_frames.zip'
-        zip_path = os.path.join(app.config['CONVERTED_FOLDER'], zip_filename)
-
-        try:
-            img = Image.open(upload_path)
-            
-            for frame_index in range(img.n_frames):
-                img.seek(frame_index)
-                frame_filename = f"{base_name}_{frame_index:03d}.png"
-                frame_path = os.path.join(temp_dir, frame_filename)
-                
-                # Sauvegarde en mémoire puis écriture pour robustesse
-                # Utilisation d'un buffer pour la mémoire avant écriture du fichier
-                img.save(frame_path, format="PNG")
-            
-            img.close()
-
-            # Création du fichier ZIP
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for frame_file in os.listdir(temp_dir):
-                    full_path = os.path.join(temp_dir, frame_file)
-                    # Ajoute le fichier au ZIP avec seulement son nom
-                    zipf.write(full_path, os.path.basename(full_path))
-            
-            # ----------------------------------------------------
-            # NETTOYAGE après l'envoi du fichier ZIP
-            @after_this_request
-            def cleanup_gif_files(response):
-                try:
-                    # Supprimer le dossier temporaire et son contenu
-                    for root, _, files in os.walk(temp_dir, topdown=False):
-                        for name in files:
-                            os.remove(os.path.join(root, name))
-                        os.rmdir(temp_dir)
-                    # Supprimer le fichier ZIP créé
-                    if os.path.exists(zip_path):
-                        os.remove(zip_path)
-                    # Supprimer le fichier GIF uploadé
-                    if os.path.exists(upload_path):
-                        os.remove(upload_path)
-                except Exception as e:
-                    app.logger.error(f"Erreur de nettoyage GIF: {e}") 
-                return response
-            # ----------------------------------------------------
-
-            return send_file(zip_path, as_attachment=True, download_name=zip_filename)
-            
         except Exception as e:
-            flash(f"Erreur lors de la conversion du GIF : {e}", 'error')
-            return redirect(url_for('index'))
-            
-    else:
-        flash('Format de fichier non autorisé (doit être .gif)', 'error')
-        return redirect(url_for('index'))
+            flash(f"Erreur lors de l'enregistrement : {e}", 'error')
 
-@app.route('/convert/mp4', methods=['POST'])
-@login_required
-def convert_mp4():
-    if 'file' not in request.files:
-        flash('Aucun fichier n\'a été envoyé', 'error')
         return redirect(url_for('index'))
     
-    file = request.files['file']
-    
-    if file.filename == '':
-        flash('Aucun fichier sélectionné', 'error')
-        return redirect(url_for('index'))
-        
-    if file and allowed_file(file.filename, {'mp4'}):
-        filename = secure_filename(file.filename)
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(upload_path)
-        
-        try:
-            converted_filename = filename.rsplit('.', 1)[0] + '.mp3'
-            converted_path = os.path.join(app.config['CONVERTED_FOLDER'], converted_filename)
-            
-            (
-                ffmpeg
-                .input(upload_path)
-                .output(converted_path, format='mp3', vn=None, acodec='libmp3lame')
-                .run(overwrite_output=True, quiet=True)
-            )
-            
-            # ----------------------------------------------------
-            # NETTOYAGE après l'envoi du fichier MP3
-            @after_this_request
-            def cleanup_mp4_files(response):
-                try:
-                    if os.path.exists(upload_path):
-                        os.remove(upload_path)
-                    if os.path.exists(converted_path):
-                        os.remove(converted_path)
-                except Exception as e:
-                    app.logger.error(f"Erreur de nettoyage MP4: {e}") 
-                return response
-            # ----------------------------------------------------
+    flash('Erreur lors de l\'upload du fichier.', 'error')
+    return redirect(url_for('index'))
 
-            return send_file(converted_path, as_attachment=True, download_name=converted_filename)
-            
-        except ffmpeg.Error as e:
-            error_message = f"Erreur FFmpeg. L'outil est introuvable ou mal configuré. Détails: {e.stderr.decode('utf8')[:200]}..."
-            flash(error_message, 'error')
-            # Suppression du fichier uploadé immédiatement si conversion échoue
-            if os.path.exists(upload_path):
-                os.remove(upload_path)
-            return redirect(url_for('index'))
-        except Exception as e:
-            flash(f"Erreur lors de la conversion : {e}", 'error')
-            if os.path.exists(upload_path):
-                os.remove(upload_path)
-            return redirect(url_for('index'))
-            
-    else:
-        flash('Format de fichier non autorisé (doit être .mp4)', 'error')
+
+@app.route('/download/<filename>')
+def download_file(filename):
+    """Permet de télécharger les fichiers convertis (simulé)."""
+    return send_from_directory('converted', filename, as_attachment=True)
+
+
+@app.route('/add_friend', methods=['POST'])
+def add_friend():
+    if 'user_username' not in session:
+        flash('Veuillez vous connecter pour ajouter des amis.', 'error')
         return redirect(url_for('index'))
+    
+    friend_username = request.form['friend_username']
+    current_username = session['user_username']
+
+    if friend_username == current_username:
+        flash("Vous ne pouvez pas vous ajouter vous-même.", 'error')
+        return redirect(url_for('index'))
+    
+    with app.app_context():
+        current_user = User.query.filter_by(username=current_username).first()
+        friend_user = User.query.filter_by(username=friend_username).first()
+
+        if not friend_user:
+            flash(f"Le pseudo @{friend_username} n'existe pas.", 'error')
+        elif current_user.is_friend(friend_user):
+            flash(f"@{friend_username} est déjà dans votre liste d'amis.", 'info')
+        else:
+            current_user.add_friend(friend_user)
+            db.session.commit()
+            flash(f"@{friend_username} a été ajouté à vos amis!", 'success')
+            
+    return redirect(url_for('index'))
+
+
+@app.route('/forgot_password', methods=['POST'])
+def forgot_password():
+    email = request.form['email']
+    
+    with app.app_context():
+        user = User.query.filter_by(email=email).first()
+
+        if user:
+            print(f"\n--- SIMULATION EMAIL (MOT DE PASSE OUBLIÉ) ---")
+            print(f"DESTINATAIRE : {email}")
+            print(f"----------------------------------------------\n")
+            
+            flash('Un lien de réinitialisation de mot de passe a été (simulé) envoyé à votre email.', 'info')
+        else:
+            flash("Aucun compte trouvé avec cet email.", 'error')
+            
+        return redirect(url_for('index'))
+
 
 # --------------------------
-# 7. LANCEMENT
+# 6. SOCKETIO (CHAT EN TEMPS RÉEL)
+# --------------------------
+
+@socketio.on('new_message')
+def handle_new_message(data):
+    user = session.get('user_username', 'Anonyme')
+    text = data.get('text', '...')
+    
+    if text and user != 'Anonyme':
+        message_data = {'user': user, 'text': text}
+        chat_messages.append(message_data)
+        
+        emit('broadcast_message', message_data, broadcast=True)
+
+# --------------------------
+# 7. LANCEMENT 
 # --------------------------
 
 if __name__ == '__main__':
-    # Le bloc db.create_all() s'exécute déjà au chargement du module
-    app.run(debug=True, host='0.0.0.0')
+    PORT_CHOISI = 5003 
+    socketio.run(app, debug=True, port=PORT_CHOISI)
