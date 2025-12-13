@@ -16,21 +16,20 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT (CRUCIAL POUR RENDER)
+# LECTURE DE LA CLÉ SECRÈTE DEPUIS L'ENVIRONNEMENT
 app.config['SECRET_KEY'] = os.environ.get(
     'SECRET_KEY', 
     'cle_secrete_de_secours_a_ne_pas_utiliser_en_prod'
 )
 
 # VOTRE URL POSTGRES COPIÉE DE RENDER
-# CORRECTION CRUCIALE #1: URL en dur pour assurer la connexion au démarrage
 RAW_DATABASE_URL = 'postgresql://pro_convert_db_user:haM3FpLxeoXTlB3lIDobF6tSnYgBHjQX@dpg-d4u4p015pdvs73bnebjg-a.virginia-postgres.render.com/pro_convert_db' 
 
-# Force la correction de l'URL pour SQLAlchemy (de postgres:// à postgresql://)
+# Correction du format de l'URL
 if RAW_DATABASE_URL.startswith('postgres://'):
     database_url = RAW_DATABASE_URL.replace('postgres://', 'postgresql://', 1)
 else:
-    database_url = RAW_DATABASE_URL # Utilise l'URL si elle est déjà au format postgresql://
+    database_url = RAW_DATABASE_URL
 
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False 
@@ -65,7 +64,7 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
     username = db.Column(db.String(80), unique=True, nullable=False)
-    # Augmenter la taille pour le hash de mot de passe
+    # Taille augmentée pour le hash de mot de passe
     password = db.Column(db.String(256), nullable=False) 
 
     # Relation d'Amis
@@ -79,7 +78,6 @@ class User(db.Model):
     )
     
     def set_password(self, password):
-        # Utiliser pbkdf2:sha256 pour une meilleure sécurité
         self.password = generate_password_hash(password, method='pbkdf2:sha256')
 
     def check_password(self, password):
@@ -92,8 +90,6 @@ class User(db.Model):
 
     def is_friend(self, user):
         with app.app_context():
-            # Correction de la syntaxe de requête pour SQLAlchemy 2.0 si nécessaire, 
-            # mais la version de la 1.x est conservée pour la compatibilité avec le code existant.
             return db.session.query(friends).filter(
                 friends.c.user_id == self.id, 
                 friends.c.friend_id == user.id
@@ -102,14 +98,26 @@ class User(db.Model):
     def __repr__(self):
         return f"User('{self.username}')"
 
+# --------------------------
+# CORRECTION DÉPLOIEMENT : CRÉATION DE TABLES FORCÉE
+# --------------------------
+# Ce bloc est CRUCIAL. Il assure que les tables DB sont créées 
+# dès que le module 'app' est chargé, contournant les problèmes de Gunicorn/Render.
+with app.app_context():
+    print("Tentative de CRÉATION des tables via app_context (fix UndefinedTable)...")
+    try:
+        # Ceci crée les tables s'ils n'existent pas
+        db.create_all() 
+        print("Tables de la base de données créées/vérifiées avec succès.")
+    except Exception as e:
+        print(f"Échec de la création des tables lors du démarrage: {e}")
+        # On log l'erreur mais on ne bloque pas le démarrage de l'application
+# --------------------------
+
 
 # --------------------------
-# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Pour l'interface utilisateur)
+# 3. LE CODE HTML/CSS/JS INTÉGRÉ (Interface utilisateur)
 # --------------------------
-
-# J'ai inclus le même HTML/CSS/JS pour maintenir l'intégrité de votre code.
-# Vous devriez envisager de séparer ceci dans des fichiers .html et d'utiliser Bootstrap 
-# comme suggéré précédemment pour une meilleure maintenabilité.
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -323,8 +331,12 @@ def convert_to_mp4(input_path, output_dir):
     # Simuler la création d'un fichier de sortie
     simulated_filename = "simulated_video_" + generate_unique_filename("mp4")
     # Créer un fichier bidon pour simuler la conversion
-    with open(os.path.join(output_dir, simulated_filename), 'w') as f:
-        f.write("Ceci est un fichier vidéo simulé.")
+    try:
+        with open(os.path.join(output_dir, simulated_filename), 'w') as f:
+            f.write("Ceci est un fichier vidéo simulé.")
+    except Exception as e:
+        print(f"Erreur lors de la création du fichier simulé: {e}")
+        return None
         
     return simulated_filename
 
@@ -341,7 +353,6 @@ def index():
         with app.app_context():
             current_user = User.query.filter_by(username=current_username).first()
             if current_user:
-                # Récupère les noms d'amis
                 friend_names = [f.username for f in current_user.friends.all()]
 
     return render_template_string(
@@ -359,6 +370,7 @@ def register():
     password = request.form['password']
 
     with app.app_context():
+        # L'erreur UndefinedTable se produit ici si la table n'est pas créée
         if User.query.filter_by(email=email).first():
             flash('Cet email est déjà enregistré.', 'error')
             return redirect(url_for('index'))
@@ -368,7 +380,7 @@ def register():
             return redirect(url_for('index'))
 
         new_user = User(email=email, username=username)
-        new_user.set_password(password) # Le set_password utilise generate_password_hash
+        new_user.set_password(password)
         
         db.session.add(new_user)
         db.session.commit()
@@ -386,7 +398,7 @@ def login():
     with app.app_context():
         user = User.query.filter_by(username=username).first()
 
-        if user and user.check_password(password): # Le check_password utilise check_password_hash
+        if user and user.check_password(password):
             session['user_username'] = username
             session['user_email'] = user.email
             flash(f'Connexion réussie pour @{username}!', 'success')
@@ -522,31 +534,9 @@ def handle_new_message(data):
         emit('broadcast_message', message_data, broadcast=True)
 
 # --------------------------
-# 7. LANCEMENT ET INITIALISATION
+# 7. LANCEMENT 
 # --------------------------
 
-def initialize_database():
-    """Crée les tables de la base de données si elles n'existent pas.
-    CORRECTION CRUCIALE #2: Cette fonction est appelée hors du 'if __name__ == "__main__"' 
-    pour s'assurer qu'elle s'exécute sur Render.
-    """
-    print("Tentative d'initialisation de la base de données...")
-    try:
-        with app.app_context():
-            # Tente de se connecter au moteur DB
-            db.engine.connect() 
-            # Crée toutes les tables qui n'existent pas encore
-            db.create_all()
-            print("Base de données initialisée avec succès.")
-    except Exception as e:
-        print(f"Erreur CRITIQUE lors de la connexion/initialisation de la DB: {e}")
-        # Lève l'exception pour que le log de Render soit clair
-        raise
-
-# Appel de l'initialisation AVANT le bloc if __name__ pour que Render l'exécute
-initialize_database()
-
 if __name__ == '__main__':
-    # Le PORT_CHOISI est ignoré sur Render; il utilise la variable d'environnement $PORT
     PORT_CHOISI = 5003 
     socketio.run(app, debug=True, port=PORT_CHOISI)
