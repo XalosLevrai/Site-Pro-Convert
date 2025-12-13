@@ -5,15 +5,9 @@ Werkzeug
 Pillow
 yt-dlp
 gunicorn
-
-# Dépendances pour le chat SocketIO
 Flask-SocketIO
 python-socketio
 python-engineio
-
-# Remplacement de ffmpeg-python par python-ffmpeg pour Render
 python-ffmpeg
 pynacl
-
-# Dépendance pour la connexion PostgreSQL
 psycopg2-binary
